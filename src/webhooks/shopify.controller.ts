@@ -1,32 +1,48 @@
-﻿import {
+import {
+  BadRequestException,
   Controller,
+  Get,
+  Header,
   Headers,
+  HttpCode,
   Post,
   RawBodyRequest,
   Req,
-  UnauthorizedException,
 } from "@nestjs/common";
 
-import { ConfigService } from "@nestjs/config";
 import { FastifyRequest } from "fastify";
 import { createHash } from "crypto";
 
 import { Prisma } from "@prisma/client";
 
-import { PrismaService } from "../prisma/prisma.service";
-import { verifyShopifyWebhook } from "./shopify-signature";
-
-import { WebhookQueueService } from "../queue/webhook.queue";
+import { WebhookIntakeService } from "./webhook-intake.service";
 
 @Controller("webhooks")
 export class ShopifyController {
-  constructor(
-    private readonly configService: ConfigService,
-    private readonly prisma: PrismaService,
-    private readonly webhookQueue: WebhookQueueService,
-  ) {}
+  constructor(private readonly intake: WebhookIntakeService) {}
+
+  /**
+   * Answer a browser or uptime probe that opens the webhook URI by hand.
+   *
+   * Shopify only ever POSTs here, so without this the honest answer is a
+   * generic 404 — which is indistinguishable from "the tunnel is not routing
+   * to this app at all" (a misconfigured Cloudflare tunnel answers the same
+   * path with its own plain-text `404 page not found`). Returning a distinct
+   * JSON body for a GET makes that difference one `curl` away.
+   */
+  @Get("shopify")
+  @HttpCode(405)
+  @Header("Allow", "POST")
+  describeWebhookEndpoint() {
+    return {
+      message:
+        "Shopify delivers webhooks to this URL with POST. A browser GET is not a delivery.",
+      expectedMethod: "POST",
+    };
+  }
 
   @Post("shopify")
+  @HttpCode(202)
   async handleShopifyWebhook(
     @Req() req: RawBodyRequest<FastifyRequest>,
     @Headers("x-shopify-hmac-sha256") signature?: string,
@@ -34,106 +50,52 @@ export class ShopifyController {
     @Headers("x-shopify-webhook-id") webhookId?: string,
     @Headers("x-shopify-topic") topic?: string,
   ) {
-    const secret = this.configService.get<string>(
-      "SHOPIFY_WEBHOOK_SECRET",
-     );
-
-    if (!secret) {
-      throw new Error(
-        "SHOPIFY_WEBHOOK_SECRET is not configured",
-      );
-    }
-
+    // Malformed deliveries are a client error, not an outage: a 400 keeps
+    // monitoring honest and stops Shopify from treating garbage as retryable.
     if (!req.rawBody) {
-      throw new Error(
-        "Raw request body is unavailable",
-      );
-    }
-
-    const valid = verifyShopifyWebhook(
-      req.rawBody,
-      signature,
-      secret,
-    );
-
-    if (!valid) {
-      throw new UnauthorizedException(
-        "Invalid Shopify webhook signature",
-      );
+      throw new BadRequestException("Raw request body is unavailable");
     }
 
     if (!shopDomain || !webhookId || !topic) {
-      throw new Error(
+      throw new BadRequestException(
         "Required Shopify webhook headers are missing",
       );
     }
 
     const rawBody = req.rawBody;
 
-    const payloadSha256 = createHash("sha256")
-      .update(rawBody)
-      .digest("hex");
+    const payloadSha256 = createHash("sha256").update(rawBody).digest("hex");
 
     let payload: Prisma.InputJsonValue;
 
     try {
-      payload = JSON.parse(
-        rawBody.toString("utf8"),
-      );
+      payload = JSON.parse(rawBody.toString("utf8"));
     } catch {
-      throw new Error(
-        "Invalid JSON webhook payload",
-      );
+      throw new BadRequestException("Invalid JSON webhook payload");
     }
 
-    // Which tenant this belongs to is exactly what we're resolving
-    // here (from shopDomain) — inherently a cross-tenant lookup that
-    // must run before any tenant context exists.
-    const webhookEventId = await this.prisma.runAsSystem(async () => {
-      const store =
-        await this.prisma.storeConnection.findUnique({
-          where: {
-            shopDomain: String(shopDomain),
-          },
-        });
-
-      if (!store) {
-        throw new Error(
-          "Shopify store not found: " +
-            String(shopDomain),
-        );
-      }
-
-      const webhookEvent =
-        await this.prisma.webhookEvent.upsert({
-          where: {
-            storeId_shopifyEventId: {
-              storeId: store.id,
-              shopifyEventId: String(webhookId),
-            },
-          },
-
-          create: {
-            tenantId: store.tenantId,
-            storeId: store.id,
-            topic: String(topic),
-            shopifyEventId: String(webhookId),
-            payload,
-            payloadSha256,
-            status: "RECEIVED",
-            attempts: 0,
-          },
-
-          update: {},
-        });
-
-      return webhookEvent.id;
+    // Authenticate, store (durable), then queue under a deadline. The
+    // signature is checked inside the intake because the signing secret is
+    // per store: a custom app has its own secret, and a store without one
+    // falls back to the deployment-wide SHOPIFY_WEBHOOK_SECRET. A queue
+    // failure raises 503 so Shopify retries with backoff instead of dropping
+    // the event — repeat failures are what get a subscription deleted.
+    const delivery = await this.intake.recordShopifyDelivery({
+      shopDomain: String(shopDomain),
+      webhookId: String(webhookId),
+      topic: String(topic),
+      payload,
+      payloadSha256,
+      rawBody,
+      signature,
     });
 
-    await this.webhookQueue.enqueue(webhookEventId);
+    await this.intake.enqueueForProcessing(delivery);
 
     return {
       accepted: true,
+      webhookEventId: delivery.webhookEventId,
+      duplicate: !delivery.shouldEnqueue,
     };
   }
 }

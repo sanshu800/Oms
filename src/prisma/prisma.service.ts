@@ -1,6 +1,8 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from "@nestjs/common";
 import { PrismaClient } from "@prisma/client";
 
+import { createPrismaAdapter, databaseUrlFromEnv } from "./prisma-adapter";
+
 import { tenantContextStorage } from "./tenant-context";
 
 function uncapitalize(value: string): string {
@@ -56,13 +58,18 @@ export class PrismaService
     // migrations (which need real DDL/ownership privileges);
     // APP_DATABASE_URL is what the running app actually queries
     // through.
-    const appDatabaseUrl = process.env.APP_DATABASE_URL;
-
-    super(
-      appDatabaseUrl
-        ? { datasources: { db: { url: appDatabaseUrl } } }
-        : undefined,
+    //
+    // The client is generated with `engineType = "client"` (see
+    // prisma/schema.prisma), so the connection must be provided by a
+    // driver adapter — queries run through the WASM query compiler and
+    // the `pg` protocol directly. That also means there is no native
+    // query engine library to download at install time or ship in the
+    // deployment artifact.
+    const adapter = createPrismaAdapter(
+      databaseUrlFromEnv(["APP_DATABASE_URL", "DATABASE_URL"]),
     );
+
+    super({ adapter });
 
     const base = this;
 
@@ -74,7 +81,14 @@ export class PrismaService
             const delegateName = model ? uncapitalize(model) : undefined;
 
             if (process.env.RLS_DEBUG) {
-              console.error("[RLS_DEBUG]", { model, operation, delegateName, ctx });
+              console.error("[RLS_DEBUG]", {
+                model,
+                operation,
+                delegateName,
+                hasContext: Boolean(ctx),
+                hasTx: Boolean(ctx?.tx),
+                redirectedToTx: Boolean(ctx?.redirectedToTx),
+              });
             }
 
             if (!ctx) {
@@ -83,7 +97,30 @@ export class PrismaService
 
             if (ctx.tx) {
               if (!delegateName) return query(args);
-              return (ctx.tx as any)[delegateName][operation](args);
+
+              // The transaction client Prisma hands to $transaction
+              // callbacks is itself extended, so calling straight
+              // through it would land back in this same hook — with
+              // the same ambient context (tx included) — and recurse
+              // until the process runs out of memory. The nested
+              // context marks that single re-dispatch; anything it
+              // triggers now runs `query(args)` on the transaction
+              // client, which is the connection the RLS session
+              // variables were stamped on.
+              if (ctx.redirectedToTx) {
+                return query(args);
+              }
+
+              // The `await` is load-bearing: Prisma model calls are lazy
+              // thenables, so a bare `return tx.model.op(args)` would hand
+              // the thenable back to the caller and the operation would not
+              // actually dispatch until it is awaited outside this run()
+              // window — by which point the marker context is gone and the
+              // hook redirects into itself forever.
+              return tenantContextStorage.run(
+                { ...ctx, redirectedToTx: true },
+                async () => (ctx.tx as any)[delegateName][operation](args),
+              );
             }
 
             return base.$transaction(async (tx) => {

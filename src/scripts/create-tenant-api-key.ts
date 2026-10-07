@@ -1,9 +1,17 @@
 import { PrismaClient } from "@prisma/client";
 
+import {
+  createPrismaAdapter,
+  databaseUrlFromEnv,
+} from "../prisma/prisma-adapter";
 import { PrismaService } from "../prisma/prisma.service";
 import { TenantApiKeyService } from "../auth/tenant-api-key.service";
 
-const prisma = new PrismaClient();
+// Admin script: connects as the schema owner so it can issue keys for
+// any tenant.
+const prisma = new PrismaClient({
+  adapter: createPrismaAdapter(databaseUrlFromEnv(["DATABASE_URL", "APP_DATABASE_URL"])),
+});
 
 async function main() {
   const tenantId = process.argv[2];

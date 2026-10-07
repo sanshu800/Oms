@@ -3,8 +3,8 @@ import { ConfigModule } from "@nestjs/config";
 
 import { HealthController } from "./health.controller";
 import { validateEnvironment } from "./config/environment";
-import { ShopifyController } from "./webhooks/shopify.controller";
 import { ShopifyModule } from "./shopify/shopify.module";
+import { WebhooksModule } from "./webhooks/webhooks.module";
 
 import { PrismaModule } from "./prisma/prisma.module";
 
@@ -29,6 +29,7 @@ import { AiModule } from "./ai/ai.module";
 
     PrismaModule,
     ShopifyModule,
+    WebhooksModule,
 
     OrderModule,
     ExceptionModule,
@@ -43,9 +44,6 @@ import { AiModule } from "./ai/ai.module";
     AiModule,
   ],
 
-  controllers: [
-    HealthController,
-    ShopifyController,
-  ],
+  controllers: [HealthController],
 })
 export class AppModule {}

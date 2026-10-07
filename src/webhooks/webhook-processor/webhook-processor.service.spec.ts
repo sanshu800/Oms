@@ -1,8 +1,11 @@
-﻿import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { WebhookStatus } from "@prisma/client";
 
+vi.mock("@prisma/client", () => import("../../../test-utils/prisma-client.mock"));
+
 import { WebhookProcessorService } from "./webhook-processor.service";
+import { COMPLIANCE_REST_TOPICS } from "../../shopify/webhook-registration";
 
 describe("WebhookProcessorService", () => {
   let service: WebhookProcessorService;
@@ -10,6 +13,10 @@ describe("WebhookProcessorService", () => {
   const prisma = {
     webhookEvent: {
       updateMany: vi.fn(),
+      findUnique: vi.fn(),
+      update: vi.fn(),
+    },
+    storeConnection: {
       findUnique: vi.fn(),
       update: vi.fn(),
     },
@@ -74,6 +81,9 @@ describe("WebhookProcessorService", () => {
     prisma.webhookEvent.findUnique.mockResolvedValue(baseEvent);
 
     prisma.webhookEvent.update.mockResolvedValue(baseEvent);
+
+    prisma.storeConnection.findUnique.mockResolvedValue({ status: "ACTIVE" });
+    prisma.storeConnection.update.mockResolvedValue({});
 
     prisma.shopifyOrderSnapshot.upsert.mockResolvedValue({});
 
@@ -199,6 +209,30 @@ describe("WebhookProcessorService", () => {
     expect(prisma.webhookEvent.update).not.toHaveBeenCalled();
   });
 
+  it.each(["orders/updated", "orders/cancelled"])(
+    "should forward %s events to the order lifecycle service",
+    async (topic) => {
+      prisma.webhookEvent.findUnique.mockResolvedValue({
+        ...baseEvent,
+        topic,
+      });
+
+      await service.processEvent("event-1", {
+        attempt: 1,
+        maxAttempts: 5,
+      });
+
+      expect(orderService.upsertFromShopify).toHaveBeenCalledWith(
+        expect.objectContaining({
+          topic,
+          tenantId: "tenant-1",
+          storeId: "store-1",
+          payload: baseEvent.payload,
+        }),
+      );
+    },
+  );
+
   it("should mark unsupported topics as processed", async () => {
     prisma.webhookEvent.findUnique.mockResolvedValue({
       ...baseEvent,
@@ -219,6 +253,166 @@ describe("WebhookProcessorService", () => {
     );
 
     expect(orderService.upsertFromShopify).not.toHaveBeenCalled();
+  });
+  it("disconnects the store and clears its token on app/uninstalled", async () => {
+    prisma.webhookEvent.findUnique.mockResolvedValue({
+      ...baseEvent,
+      topic: "app/uninstalled",
+    });
+
+    await service.processEvent("event-1", { attempt: 1, maxAttempts: 5 });
+
+    expect(prisma.storeConnection.update).toHaveBeenCalledWith({
+      where: { id: "store-1" },
+      data: {
+        status: "DISCONNECTED",
+        disconnectedAt: expect.any(Date),
+        encryptedAccessToken: null,
+      },
+    });
+
+    expect(orderService.upsertFromShopify).not.toHaveBeenCalled();
+    expect(prisma.webhookEvent.update).toHaveBeenCalledWith({
+      where: { id: "event-1" },
+      data: {
+        status: "PROCESSED",
+        processedAt: expect.any(Date),
+        lastError: null,
+      },
+    });
+    expect(auditService.recordEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ action: "STORE_DISCONNECTED" }),
+    );
+  });
+
+  it("ignores order events for a disconnected store", async () => {
+    prisma.storeConnection.findUnique.mockResolvedValue({
+      status: "DISCONNECTED",
+    });
+
+    await service.processEvent("event-1", { attempt: 1, maxAttempts: 5 });
+
+    expect(orderService.upsertFromShopify).not.toHaveBeenCalled();
+    expect(auditService.recordEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "WEBHOOK_IGNORED",
+        metadata: expect.objectContaining({
+          reason: "Store connection is DISCONNECTED",
+        }),
+      }),
+    );
+  });
+
+  it("records a privacy request instead of dropping it", async () => {
+    prisma.webhookEvent.findUnique.mockResolvedValue({
+      ...baseEvent,
+      topic: "customers/redact",
+      payload: { shop_id: 1, customer: { id: 42 } },
+    });
+
+    await service.processEvent("event-1", { attempt: 1, maxAttempts: 5 });
+
+    expect(orderService.upsertFromShopify).not.toHaveBeenCalled();
+    expect(auditService.recordEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ action: "COMPLIANCE_REQUEST_RECEIVED" }),
+    );
+    expect(exceptionService.createOrUpdateException).toHaveBeenCalledWith(
+      expect.objectContaining({
+        category: "COMPLIANCE",
+        severity: "HIGH",
+        fingerprint: expect.stringContaining("customers/redact"),
+      }),
+    );
+  });
+
+  // Regression: the data request is the one privacy topic whose REST name is
+  // not a mechanical conversion of its GraphQL name (`customers/data_request`
+  // keeps the underscore). Deriving it with a blanket `_ → /` rewrite produced
+  // `customers/data/request`, which matched nothing and let the request fall
+  // through to the unsupported-topic branch.
+  it("records customers/data_request, whose topic name keeps an underscore", async () => {
+    prisma.webhookEvent.findUnique.mockResolvedValue({
+      ...baseEvent,
+      topic: "customers/data_request",
+      payload: { shop_id: 1, customer: { id: 42 }, orders_requested: [1001] },
+    });
+
+    await service.processEvent("event-1", { attempt: 1, maxAttempts: 5 });
+
+    expect(orderService.upsertFromShopify).not.toHaveBeenCalled();
+    expect(auditService.recordEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ action: "COMPLIANCE_REQUEST_RECEIVED" }),
+    );
+    expect(exceptionService.createOrUpdateException).toHaveBeenCalledWith(
+      expect.objectContaining({
+        category: "COMPLIANCE",
+        severity: "HIGH",
+        fingerprint: expect.stringContaining("customers/data_request"),
+      }),
+    );
+  });
+
+  // Every compliance topic the app can register must have a handler. Driving
+  // the whole set through the processor is what catches the class of bug where
+  // a GraphQL topic name is mechanically rewritten into a REST name that no
+  // delivery ever carries: the request is acknowledged, matched against
+  // nothing, and dropped — the one outcome Shopify's 30-day window cannot
+  // survive.
+  it.each(COMPLIANCE_REST_TOPICS)(
+    "escalates the %s delivery instead of dropping it",
+    async (topic) => {
+      prisma.webhookEvent.findUnique.mockResolvedValue({
+        ...baseEvent,
+        topic,
+        payload: { shop_id: 1 },
+      });
+
+      await service.processEvent("event-1", { attempt: 1, maxAttempts: 5 });
+
+      expect(orderService.upsertFromShopify).not.toHaveBeenCalled();
+      expect(exceptionService.createOrUpdateException).toHaveBeenCalledWith(
+        expect.objectContaining({
+          category: "COMPLIANCE",
+          severity: "HIGH",
+          fingerprint: expect.stringContaining(topic),
+        }),
+      );
+      expect(auditService.recordEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ action: "COMPLIANCE_REQUEST_RECEIVED" }),
+      );
+      expect(auditService.recordEvent).not.toHaveBeenCalledWith(
+        expect.objectContaining({ action: "WEBHOOK_IGNORED" }),
+      );
+    },
+  );
+
+  // A merchant who uninstalled still has data rights: Shopify keeps sending
+  // privacy topics after the install is gone, and dropping them would put the
+  // store past the 30-day window with no record that a request ever arrived.
+  it("still records a privacy request after the store has been disconnected", async () => {
+    prisma.storeConnection.findUnique.mockResolvedValue({
+      status: "DISCONNECTED",
+    });
+    prisma.webhookEvent.findUnique.mockResolvedValue({
+      ...baseEvent,
+      topic: "customers/data_request",
+      payload: { shop_id: 1, customer: { id: 42 } },
+    });
+
+    await service.processEvent("event-1", { attempt: 1, maxAttempts: 5 });
+
+    expect(exceptionService.createOrUpdateException).toHaveBeenCalledWith(
+      expect.objectContaining({
+        category: "COMPLIANCE",
+        severity: "HIGH",
+      }),
+    );
+    expect(auditService.recordEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ action: "COMPLIANCE_REQUEST_RECEIVED" }),
+    );
+    expect(auditService.recordEvent).not.toHaveBeenCalledWith(
+      expect.objectContaining({ action: "WEBHOOK_IGNORED" }),
+    );
   });
 });
 

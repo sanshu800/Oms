@@ -1,9 +1,13 @@
-﻿import { Injectable, Logger } from "@nestjs/common";
+import { Injectable, Logger } from "@nestjs/common";
 import {
   AuditActorType,
   ExceptionSeverity,
+  Prisma,
+  StoreConnectionStatus,
   WebhookStatus,
 } from "@prisma/client";
+
+import { isComplianceRestTopic } from "../../shopify/webhook-registration";
 
 import { PrismaService } from "../../prisma/prisma.service";
 import { OrderService } from "../../oms/order/order.service";
@@ -111,7 +115,65 @@ export class WebhookProcessorService {
     });
 
     try {
-      if (event.topic !== "orders/create") {
+      // Store lifecycle first: everything else assumes a live connection
+      // with a valid access token.
+      if (event.topic === "app/uninstalled") {
+        await this.handleStoreUninstalled(event);
+        return;
+      }
+
+      // Privacy requests are answered before the store-status check below:
+      // a merchant who uninstalled still has 30 days of data rights, and
+      // Shopify keeps delivering these topics after the install is gone.
+      if (isComplianceRestTopic(event.topic)) {
+        await this.handleComplianceRequest(event);
+        return;
+      }
+
+      const store = await this.prisma.storeConnection.findUnique({
+        where: { id: event.storeId },
+        select: { status: true },
+      });
+
+      // A disconnected store's deliveries (uninstall, then any in-flight
+      // order events) must not be processed against a dead connection.
+      if (store && store.status !== StoreConnectionStatus.ACTIVE) {
+        await this.prisma.webhookEvent.update({
+          where: { id: event.id },
+          data: {
+            status: WebhookStatus.PROCESSED,
+            processedAt: new Date(),
+            lastError: null,
+          },
+        });
+
+        await this.auditService.recordEvent({
+          tenantId: event.tenantId,
+          storeId: event.storeId,
+          action: "WEBHOOK_IGNORED",
+          actorType: AuditActorType.INTEGRATION,
+          entityType: "WEBHOOK_EVENT",
+          entityId: event.id,
+          metadata: {
+            topic: event.topic,
+            reason: `Store connection is ${store.status}`,
+          },
+        });
+
+        this.logger.warn(
+          `Ignored ${event.topic} for disconnected store ${event.storeId}`,
+        );
+
+        return;
+      }
+
+      const supportedOrderTopics = [
+        "orders/create",
+        "orders/updated",
+        "orders/cancelled",
+      ];
+
+      if (!supportedOrderTopics.includes(event.topic)) {
         await this.prisma.webhookEvent.update({
           where: {
             id: event.id,
@@ -139,7 +201,7 @@ export class WebhookProcessorService {
         return;
       }
 
-      const order = await this.processOrderCreate(event);
+      const order = await this.processOrderWebhook(event);
 
       await this.prisma.webhookEvent.update({
         where: {
@@ -332,10 +394,119 @@ export class WebhookProcessorService {
     }
   }
 
-  private async processOrderCreate(event: {
+  /**
+   * Shopify calls this when the merchant removes the app. The access token
+   * stored on the connection is revoked by that action, so the connection
+   * must stop being usable immediately: mark it disconnected, drop the
+   * token, and leave the tenant's operational data intact for exempt
+   * records and for a later reinstall to reuse.
+   */
+  private async handleStoreUninstalled(event: {
     id: string;
     tenantId: string;
     storeId: string;
+  }): Promise<void> {
+    await this.prisma.storeConnection.update({
+      where: { id: event.storeId },
+      data: {
+        status: StoreConnectionStatus.DISCONNECTED,
+        disconnectedAt: new Date(),
+        encryptedAccessToken: null,
+      },
+    });
+
+    await this.prisma.webhookEvent.update({
+      where: { id: event.id },
+      data: {
+        status: WebhookStatus.PROCESSED,
+        processedAt: new Date(),
+        lastError: null,
+      },
+    });
+
+    await this.auditService.recordEvent({
+      tenantId: event.tenantId,
+      storeId: event.storeId,
+      action: "STORE_DISCONNECTED",
+      actorType: AuditActorType.INTEGRATION,
+      entityType: "STORE_CONNECTION",
+      entityId: event.storeId,
+      metadata: {
+        reason: "app/uninstalled webhook received",
+        webhookEventId: event.id,
+      },
+    });
+
+    this.logger.warn(
+      `Store ${event.storeId} disconnected via app/uninstalled; access token cleared`,
+    );
+  }
+
+  /**
+   * Shopify's mandatory privacy topics. The endpoint acknowledges them
+   * (the intake already stored the payload and replied 202) and records an
+   * auditable request. Performing the export/erasure itself is tenant
+   * data-governance work tracked in the roadmap — until that exists, the
+   * request is surfaced as an operational exception so it cannot be
+   * silently missed inside the 30-day compliance window.
+   */
+  private async handleComplianceRequest(event: {
+    id: string;
+    tenantId: string;
+    storeId: string;
+    topic: string;
+    payload: unknown;
+  }): Promise<void> {
+    await this.prisma.webhookEvent.update({
+      where: { id: event.id },
+      data: {
+        status: WebhookStatus.PROCESSED,
+        processedAt: new Date(),
+        lastError: null,
+      },
+    });
+
+    await this.auditService.recordEvent({
+      tenantId: event.tenantId,
+      storeId: event.storeId,
+      action: "COMPLIANCE_REQUEST_RECEIVED",
+      actorType: AuditActorType.INTEGRATION,
+      entityType: "WEBHOOK_EVENT",
+      entityId: event.id,
+      metadata: {
+        topic: event.topic,
+        payload: event.payload as Prisma.InputJsonValue,
+      },
+    });
+
+    await this.exceptionService.createOrUpdateException({
+      tenantId: event.tenantId,
+      storeId: event.storeId,
+      fingerprint: `COMPLIANCE:${event.storeId}:${event.topic}:${event.id}`,
+      category: "COMPLIANCE",
+      severity: ExceptionSeverity.HIGH,
+      title: `Shopify privacy request requires action: ${event.topic}`,
+      evidence: {
+        webhookEventId: event.id,
+        topic: event.topic,
+        payload: event.payload as Prisma.InputJsonValue,
+        shopifyDeadline:
+          "Shopify expects compliance requests to be handled within 30 days",
+      },
+      recommendedNextStep:
+        "Export or erase the requested customer/store data, then record the outcome. Automated export/erasure is not implemented yet.",
+    });
+
+    this.logger.warn(
+      `Recorded Shopify compliance request ${event.topic} (${event.id}) for manual handling`,
+    );
+  }
+
+  private async processOrderWebhook(event: {
+    id: string;
+    tenantId: string;
+    storeId: string;
+    topic: string;
     shopifyEventId: string;
     payload: unknown;
   }) {
@@ -396,6 +567,7 @@ export class WebhookProcessorService {
     return this.orderService.upsertFromShopify({
       tenantId: event.tenantId,
       storeId: event.storeId,
+      topic: event.topic as "orders/create" | "orders/updated" | "orders/cancelled",
       payload,
     });
   }

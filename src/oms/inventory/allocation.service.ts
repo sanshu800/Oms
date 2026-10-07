@@ -1,4 +1,4 @@
-﻿import { Injectable } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import {
   InventoryMovementType,
   InventoryReservationStatus,
@@ -33,7 +33,19 @@ export class AllocationService {
         throw new Error('Order not found for inventory allocation');
       }
 
-      if (order.items.length === 0) {
+      const invalidItem = order.items.find(
+        (item) => !Number.isInteger(item.quantity) || item.quantity < 0,
+      );
+      if (invalidItem) {
+        throw new Error(`Invalid quantity for SKU: ${invalidItem.sku}`);
+      }
+
+      // A zero quantity is a retained historical line removed by Shopify.
+      // It must not participate in a new stock allocation.
+      const reservableItems = order.items.filter(
+        (item) => item.quantity > 0,
+      );
+      if (reservableItems.length === 0) {
         return {
           reserved: false,
           reason: 'NO_LINE_ITEMS',
@@ -43,12 +55,7 @@ export class AllocationService {
 
       let reservationCount = 0;
 
-      for (const orderItem of order.items) {
-        if (!Number.isInteger(orderItem.quantity) || orderItem.quantity <= 0) {
-          throw new Error(
-            `Invalid quantity for SKU: ${orderItem.sku}`,
-          );
-        }
+      for (const orderItem of reservableItems) {
 
         const inventoryItem = await tx.inventoryItem.findUnique({
           where: {

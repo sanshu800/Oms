@@ -1,10 +1,20 @@
 generator client {
   provider = "prisma-client-js"
+  // "client" runs queries through Prisma's WASM query compiler plus a
+  // driver adapter (see src/prisma/prisma.service.ts), so no native
+  // query engine binary has to be downloaded or shipped.
+  engineType = "client"
 }
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
+  // Kept for schema/config resolution only: migrations and the running
+  // client both get their connection from a driver adapter (see
+  // prisma.config.ts and src/prisma/prisma.service.ts), so Prisma warns
+  // that this value is unused. It stays because Prisma 6.x requires a
+  // resolvable datasource url to load the schema at all — and without
+  // it the CLI falls back to the native-engine code path.
+  url = env("DATABASE_URL")
 }
 
 enum StorePlatform {
@@ -206,7 +216,13 @@ model StoreConnection {
   status StoreConnectionStatus @default(PENDING)
 
   encryptedAccessToken String?
-  scopes               String[] @default([])
+  /// The app secret that signs this store's webhook deliveries.
+  /// Null falls back to the deployment-wide SHOPIFY_WEBHOOK_SECRET, which
+  /// is correct for an OAuth app (one secret, every store that installs it)
+  /// and wrong for custom apps (each admin-created app has its own secret,
+  /// so a second store would have its deliveries rejected).
+  encryptedWebhookSecret String?
+  scopes                 String[] @default([])
 
   installedAt    DateTime?
   disconnectedAt DateTime?

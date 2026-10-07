@@ -13,6 +13,15 @@ export type TenantRlsContext = {
   tenantId?: string;
   bypass?: boolean;
   tx?: unknown;
+  /**
+   * Set only on the nested context used while a query is being
+   * re-dispatched onto an already-open transaction client. It tells
+   * the interception hook "this call is already on the transaction",
+   * which stops the hook from redirecting the same call again (the
+   * transaction client is extended, so without this marker the
+   * redirect would recurse until the process runs out of memory).
+   */
+  redirectedToTx?: boolean;
 };
 
 export const tenantContextStorage = new AsyncLocalStorage<TenantRlsContext>();
