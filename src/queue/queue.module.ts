@@ -1,4 +1,4 @@
-﻿import { Module } from "@nestjs/common";
+import { Module } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { BullModule } from "@nestjs/bullmq";
 
@@ -15,6 +15,7 @@ import {
 
 import { WebhookProcessorService } from "../webhooks/webhook-processor/webhook-processor.service";
 import { WebhookWorker } from "./webhook.worker";
+import { parseRedisConnectionOptions } from "../config/redis-connection";
 
 @Module({
   imports: [
@@ -27,16 +28,9 @@ import { WebhookWorker } from "./webhook.worker";
     BullModule.forRootAsync({
       inject: [ConfigService],
       useFactory: (configService: ConfigService) => ({
-        connection: {
-          host: configService.get<string>(
-            "QUEUE_REDIS_HOST",
-            "localhost",
-          ),
-          port: configService.get<number>(
-            "QUEUE_REDIS_PORT",
-            6379,
-          ),
-        },
+        connection: parseRedisConnectionOptions(
+          configService.getOrThrow<string>("REDIS_URL"),
+        ),
 
         defaultJobOptions: {
           attempts: 5,

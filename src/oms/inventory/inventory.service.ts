@@ -138,27 +138,55 @@ export class InventoryService {
   async listItems(input: {
     tenantId: string;
     storeId: string;
+    query?: string;
+    page?: number;
+    limit?: number;
   }) {
-    return this.prisma.inventoryItem.findMany({
-      where: {
-        tenantId: input.tenantId,
-      },
-      include: {
-        balances: {
-          include: {
-            location: true,
+    const page = Math.max(input.page ?? 1, 1);
+    const limit = Math.min(Math.max(input.limit ?? 50, 1), 100);
+    const query = input.query?.trim();
+    const where: Prisma.InventoryItemWhereInput = {
+      tenantId: input.tenantId,
+      active: true,
+      ...(query
+        ? {
+            OR: [
+              { sku: { contains: query, mode: 'insensitive' } },
+              { name: { contains: query, mode: 'insensitive' } },
+            ],
+          }
+        : {}),
+    };
+
+    const [items, total] = await this.prisma.$transaction([
+      this.prisma.inventoryItem.findMany({
+        where,
+        include: {
+          balances: {
+            include: {
+              location: true,
+            },
+          },
+          externalReferences: {
+            where: {
+              storeId: input.storeId,
+            },
           },
         },
-        externalReferences: {
-          where: {
-            storeId: input.storeId,
-          },
-        },
-      },
-      orderBy: {
-        sku: 'asc',
-      },
-    });
+        orderBy: { sku: 'asc' },
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+      this.prisma.inventoryItem.count({ where }),
+    ]);
+
+    return {
+      items,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    };
   }
 
   async adjustStock(input: {

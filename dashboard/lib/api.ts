@@ -1,5 +1,6 @@
-const API_URL =
-  process.env.NEXT_PUBLIC_API_URL?.replace(/\/+$/, "") ?? "http://localhost:4000";
+// Browser requests stay same-origin; Next.js proxies /api/* to the private
+// backend using the server-only API_SERVER_URL setting.
+const API_URL = "/api";
 
 const KEY_STORAGE_KEY = "techmart_api_key";
 
@@ -78,6 +79,98 @@ export type Store = {
 export type MeResponse = {
   tenant: { id: string; name: string; createdAt: string } | null;
   stores: Store[];
+};
+
+
+export type OrderStatus =
+  | "NEW"
+  | "CONFIRMED"
+  | "PROCESSING"
+  | "READY_TO_FULFILL"
+  | "FULFILLING"
+  | "FULFILLED"
+  | "CANCELLED"
+  | "FAILED";
+
+export type Order = {
+  id: string;
+  tenantId: string;
+  storeId: string;
+  externalOrderId: string;
+  orderNumber: string;
+  status: OrderStatus;
+  paymentStatus: string;
+  fulfillmentStatus: string;
+  totalAmount: string;
+  currency: string;
+  orderedAt: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type OrderLineItem = {
+  id: string;
+  externalLineItemId: string;
+  inventoryItemId: string | null;
+  sku: string;
+  title: string;
+  quantity: number;
+  unitPrice: string | null;
+};
+
+export type InventoryReservation = {
+  id: string;
+  orderId: string;
+  orderItemId: string;
+  inventoryItemId: string;
+  locationId: string;
+  quantity: number;
+  status: "ACTIVE" | "RELEASED" | "COMMITTED" | "SHIPPED";
+  createdAt: string;
+};
+
+export type OrderDetails = Order & {
+  items: OrderLineItem[];
+  reservations: InventoryReservation[];
+  fulfillments: Array<{
+    id: string;
+    status: string;
+    items: Array<{ id: string; orderItemId: string; quantity: number }>;
+    shipments: Array<{
+      id: string;
+      status: string;
+      trackingNumber: string | null;
+      carrier: string | null;
+    }>;
+  }>;
+};
+
+export type PaginatedResponse<T> = {
+  items: T[];
+  total: number;
+  page: number;
+  limit: number;
+  totalPages: number;
+};
+
+export type InventoryBalance = {
+  availableQty: number;
+  reservedQty: number;
+  committedQty: number;
+  location: { id: string; name: string; code: string };
+};
+
+export type InventoryItem = {
+  id: string;
+  sku: string;
+  name: string;
+  active: boolean;
+  balances: InventoryBalance[];
+  externalReferences: Array<{
+    id: string;
+    platform: string;
+    externalId: string;
+  }>;
 };
 
 export type OperationalException = {
@@ -211,6 +304,52 @@ export const api = {
 
   async me(): Promise<MeResponse> {
     return request<MeResponse>("/me");
+  },
+
+  async listOrders(input: {
+    storeId: string;
+    status?: string;
+    page?: number;
+    limit?: number;
+  }): Promise<PaginatedResponse<Order>> {
+    const params = new URLSearchParams({ storeId: input.storeId });
+    if (input.status) params.set("status", input.status);
+    if (input.page) params.set("page", String(input.page));
+    if (input.limit) params.set("limit", String(input.limit));
+    return request(`/oms/orders?${params.toString()}`);
+  },
+
+  async getOrder(input: {
+    orderId: string;
+    storeId: string;
+  }): Promise<OrderDetails> {
+    const params = new URLSearchParams({ storeId: input.storeId });
+    return request(
+      `/oms/orders/${encodeURIComponent(input.orderId)}?${params.toString()}`,
+    );
+  },
+
+  async listInventory(input: {
+    storeId: string;
+    query?: string;
+    page?: number;
+    limit?: number;
+  }): Promise<PaginatedResponse<InventoryItem>> {
+    const params = new URLSearchParams({ storeId: input.storeId });
+    if (input.query) params.set("q", input.query);
+    if (input.page) params.set("page", String(input.page));
+    if (input.limit) params.set("limit", String(input.limit));
+    return request(`/oms/inventory?${params.toString()}`);
+  },
+
+  async getInventoryItem(input: {
+    sku: string;
+    storeId: string;
+  }): Promise<InventoryItem> {
+    const params = new URLSearchParams({ storeId: input.storeId });
+    return request(
+      `/oms/inventory/${encodeURIComponent(input.sku)}?${params.toString()}`,
+    );
   },
 
   async listExceptions(input: {

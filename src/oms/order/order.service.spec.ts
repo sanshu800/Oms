@@ -1,10 +1,12 @@
-﻿import {
+import {
   beforeEach,
   describe,
   expect,
   it,
   vi,
 } from 'vitest';
+
+vi.mock('@prisma/client', () => import('../../../test-utils/prisma-client.mock'));
 
 import { OrderService } from './order.service';
 
@@ -19,6 +21,10 @@ describe('OrderService', () => {
       findFirst: vi.fn(),
       updateMany: vi.fn(),
       findUniqueOrThrow: vi.fn(),
+    },
+    orderItem: {
+      create: vi.fn(),
+      update: vi.fn(),
     },
   };
 
@@ -193,6 +199,299 @@ describe('OrderService', () => {
       },
     });
   });
+
+  it('reconciles changed Shopify line items and re-reserves the order', async () => {
+    prisma.order.findUnique.mockResolvedValue({
+      id: 'oms-order-update-001',
+      externalOrderId: '123456791',
+      orderNumber: '#1003',
+      status: 'NEW',
+      paymentStatus: 'paid',
+      fulfillmentStatus: 'unfulfilled',
+      totalAmount: '10.00',
+      currency: 'USD',
+      orderedAt: new Date('2026-08-22T12:00:00Z'),
+      items: [
+        {
+          id: 'order-item-update-001',
+          externalLineItemId: 'line-1',
+          sku: 'sku-old',
+          title: 'Product',
+          quantity: 1,
+          unitPrice: '10.00',
+        },
+      ],
+      reservations: [{ status: 'ACTIVE' }],
+    });
+    prisma.order.update.mockResolvedValue({});
+    prisma.orderItem.update.mockResolvedValue({});
+    prisma.order.findUniqueOrThrow.mockResolvedValue({
+      id: 'oms-order-update-001',
+      orderNumber: '#1003',
+      items: [],
+    });
+
+    const result = await service.upsertFromShopify({
+      tenantId: 'tenant-001',
+      storeId: 'store-001',
+      topic: 'orders/updated',
+      payload: {
+        id: 123456791,
+        name: '#1003',
+        financial_status: 'paid',
+        fulfillment_status: null,
+        total_price: '20.00',
+        currency: 'USD',
+        created_at: '2026-08-22T12:00:00Z',
+        line_items: [
+          {
+            id: 'line-1',
+            sku: 'sku-new',
+            title: 'Product updated',
+            quantity: 2,
+            price: '10.00',
+          },
+        ],
+      },
+    });
+
+    expect(inventoryService.releaseOrder).toHaveBeenCalledWith({
+      tenantId: 'tenant-001',
+      storeId: 'store-001',
+      orderId: 'oms-order-update-001',
+    });
+    expect(prisma.orderItem.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'order-item-update-001' },
+        data: expect.objectContaining({
+          sku: 'sku-new',
+          quantity: 2,
+          inventoryItemId: null,
+        }),
+      }),
+    );
+    expect(inventoryService.reserveOrder).toHaveBeenCalledWith({
+      tenantId: 'tenant-001',
+      storeId: 'store-001',
+      orderId: 'oms-order-update-001',
+    });
+    expect(result.id).toBe('oms-order-update-001');
+  });
+
+  it('cancels an existing Shopify order and releases its active stock reservation', async () => {
+    prisma.order.findUnique.mockResolvedValue({
+      id: 'oms-order-cancel-001',
+      externalOrderId: '123456792',
+      orderNumber: '#1004',
+      status: 'NEW',
+      paymentStatus: 'paid',
+      fulfillmentStatus: 'unfulfilled',
+      items: [],
+      reservations: [{ status: 'ACTIVE' }],
+    });
+    prisma.order.update.mockResolvedValue({});
+    prisma.order.findUniqueOrThrow.mockResolvedValue({
+      id: 'oms-order-cancel-001',
+      status: 'CANCELLED',
+      items: [],
+    });
+
+    const result = await service.upsertFromShopify({
+      tenantId: 'tenant-001',
+      storeId: 'store-001',
+      topic: 'orders/cancelled',
+      payload: {
+        id: 123456792,
+        name: '#1004',
+        financial_status: 'refunded',
+        fulfillment_status: null,
+        total_price: '0.00',
+        currency: 'USD',
+        created_at: '2026-08-23T12:00:00Z',
+        cancelled_at: '2026-08-23T13:00:00Z',
+      },
+    });
+
+    expect(inventoryService.releaseOrder).toHaveBeenCalledWith({
+      tenantId: 'tenant-001',
+      storeId: 'store-001',
+      orderId: 'oms-order-cancel-001',
+    });
+    expect(prisma.order.update).toHaveBeenLastCalledWith({
+      where: { id: 'oms-order-cancel-001' },
+      data: { status: 'CANCELLED' },
+    });
+    expect(inventoryService.reserveOrder).not.toHaveBeenCalled();
+    expect(result.status).toBe('CANCELLED');
+  });
+
+  it('does not change committed SKU or quantity when Shopify updates a fulfilled order', async () => {
+    prisma.order.findUnique.mockResolvedValue({
+      id: 'oms-order-fulfilled-001',
+      externalOrderId: '123456793',
+      orderNumber: '#1005',
+      status: 'FULFILLED',
+      paymentStatus: 'paid',
+      fulfillmentStatus: 'fulfilled',
+      items: [
+        {
+          id: 'order-item-fulfilled-001',
+          externalLineItemId: 'line-1',
+          sku: 'sku-original',
+          title: 'Product',
+          quantity: 1,
+          unitPrice: '10.00',
+        },
+      ],
+      reservations: [{ status: 'SHIPPED' }],
+    });
+    prisma.order.update.mockResolvedValue({});
+    prisma.orderItem.update.mockResolvedValue({});
+    prisma.order.findUniqueOrThrow.mockResolvedValue({
+      id: 'oms-order-fulfilled-001',
+      items: [],
+    });
+
+    await service.upsertFromShopify({
+      tenantId: 'tenant-001',
+      storeId: 'store-001',
+      topic: 'orders/updated',
+      payload: {
+        id: 123456793,
+        name: '#1005',
+        financial_status: 'paid',
+        fulfillment_status: 'fulfilled',
+        total_price: '20.00',
+        currency: 'USD',
+        created_at: '2026-08-24T12:00:00Z',
+        line_items: [
+          {
+            id: 'line-1',
+            sku: 'sku-changed',
+            title: 'Product description changed',
+            quantity: 2,
+            price: '10.00',
+          },
+        ],
+      },
+    });
+
+    expect(prisma.orderItem.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'order-item-fulfilled-001' },
+        data: expect.not.objectContaining({
+          sku: expect.anything(),
+          quantity: expect.anything(),
+        }),
+      }),
+    );
+    expect(inventoryService.releaseOrder).not.toHaveBeenCalled();
+    expect(inventoryService.reserveOrder).not.toHaveBeenCalled();
+  });
+
+
+  it('retries an order allocation when a replay still has uncovered quantity', async () => {
+    prisma.order.findUnique.mockResolvedValue({
+      id: 'oms-order-retry-001',
+      externalOrderId: '123456794',
+      orderNumber: '#1006',
+      status: 'FAILED',
+      paymentStatus: 'paid',
+      fulfillmentStatus: 'unfulfilled',
+      items: [
+        {
+          id: 'order-item-retry-001',
+          externalLineItemId: 'line-1',
+          sku: 'sku-managed-1',
+          title: 'Product',
+          quantity: 2,
+          unitPrice: '5.00',
+        },
+      ],
+      reservations: [],
+    });
+    prisma.order.update.mockResolvedValue({});
+    prisma.orderItem.update.mockResolvedValue({});
+    prisma.order.findUniqueOrThrow.mockResolvedValue({
+      id: 'oms-order-retry-001',
+      orderNumber: '#1006',
+      items: [
+        {
+          id: 'order-item-retry-001',
+          sku: 'sku-managed-1',
+          quantity: 2,
+        },
+      ],
+    });
+
+    await service.upsertFromShopify({
+      tenantId: 'tenant-001',
+      storeId: 'store-001',
+      topic: 'orders/updated',
+      payload: {
+        id: 123456794,
+        name: '#1006',
+        financial_status: 'paid',
+        fulfillment_status: null,
+        total_price: '10.00',
+        currency: 'USD',
+        created_at: '2026-08-25T12:00:00Z',
+        line_items: [
+          {
+            id: 'line-1',
+            sku: 'sku-managed-1',
+            title: 'Product',
+            quantity: 2,
+            price: '5.00',
+          },
+        ],
+      },
+    });
+
+    expect(inventoryService.reserveOrder).toHaveBeenCalledWith({
+      tenantId: 'tenant-001',
+      storeId: 'store-001',
+      orderId: 'oms-order-retry-001',
+    });
+  });
+
+
+  it('ignores an out-of-order Shopify update after cancellation', async () => {
+    prisma.order.findUnique.mockResolvedValue({
+      id: 'oms-order-cancelled-terminal',
+      externalOrderId: '123456795',
+      orderNumber: '#1007',
+      status: 'CANCELLED',
+      items: [],
+      reservations: [],
+    });
+    prisma.order.findUniqueOrThrow.mockResolvedValue({
+      id: 'oms-order-cancelled-terminal',
+      status: 'CANCELLED',
+      items: [],
+    });
+
+    await service.upsertFromShopify({
+      tenantId: 'tenant-001',
+      storeId: 'store-001',
+      topic: 'orders/updated',
+      payload: {
+        id: 123456795,
+        name: '#1007',
+        financial_status: 'paid',
+        fulfillment_status: null,
+        total_price: '10.00',
+        currency: 'USD',
+        created_at: '2026-08-26T12:00:00Z',
+        line_items: [],
+      },
+    });
+
+    expect(prisma.order.update).not.toHaveBeenCalled();
+    expect(inventoryService.releaseOrder).not.toHaveBeenCalled();
+    expect(inventoryService.reserveOrder).not.toHaveBeenCalled();
+  });
+
 });
 
 

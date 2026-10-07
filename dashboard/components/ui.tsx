@@ -90,6 +90,19 @@ const statusClasses: Record<string, string> = {
   REJECTED: "bg-slate-100 text-slate-500",
   EXECUTED: "bg-emerald-50 text-emerald-700",
   EXECUTION_FAILED: "bg-red-50 text-red-700",
+  NEW: "bg-slate-100 text-slate-700",
+  CONFIRMED: "bg-blue-50 text-blue-700",
+  PROCESSING: "bg-blue-50 text-blue-700",
+  READY_TO_FULFILL: "bg-indigo-50 text-indigo-700",
+  FULFILLING: "bg-indigo-50 text-indigo-700",
+  FULFILLED: "bg-emerald-50 text-emerald-700",
+  CANCELLED: "bg-slate-100 text-slate-500",
+  FAILED: "bg-red-50 text-red-700",
+  ACTIVE: "bg-emerald-50 text-emerald-700",
+  INACTIVE: "bg-slate-100 text-slate-500",
+  RELEASED: "bg-slate-100 text-slate-500",
+  COMMITTED: "bg-indigo-50 text-indigo-700",
+  SHIPPED: "bg-emerald-50 text-emerald-700",
 };
 
 export function StatusBadge({ status }: { status: string }) {

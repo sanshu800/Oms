@@ -1,0 +1,32 @@
+diff --git a/node_modules/@prisma/adapter-pg/dist/index.js b/node_modules/@prisma/adapter-pg/dist/index.js
+index 6baabe2..1446a75 100644
+--- a/node_modules/@prisma/adapter-pg/dist/index.js
++++ b/node_modules/@prisma/adapter-pg/dist/index.js
+@@ -232,6 +232,11 @@ function fieldToColumnType(fieldTypeId) {
+       return import_driver_adapter_utils.ColumnTypeEnum.Uuid;
+     case ScalarColumnType.OID:
+       return import_driver_adapter_utils.ColumnTypeEnum.Int64;
++    // OID 19 ("name", e.g. current_schema()/current_database()) is
++    // reported as text by PostgreSQL semantics. The upstream adapter
++    // added this mapping in 7.x; without it the JavaScript schema engine
++    // fails to initialize migrations.
++    case 19:
+     case ScalarColumnType.BPCHAR:
+     case ScalarColumnType.TEXT:
+     case ScalarColumnType.VARCHAR:
+diff --git a/node_modules/@prisma/adapter-pg/dist/index.mjs b/node_modules/@prisma/adapter-pg/dist/index.mjs
+index f2be06d..fbb4203 100644
+--- a/node_modules/@prisma/adapter-pg/dist/index.mjs
++++ b/node_modules/@prisma/adapter-pg/dist/index.mjs
+@@ -196,6 +196,11 @@ function fieldToColumnType(fieldTypeId) {
+       return ColumnTypeEnum.Uuid;
+     case ScalarColumnType.OID:
+       return ColumnTypeEnum.Int64;
++    // OID 19 ("name", e.g. current_schema()/current_database()) is
++    // reported as text by PostgreSQL semantics. The upstream adapter
++    // added this mapping in 7.x; without it the JavaScript schema engine
++    // fails to initialize migrations.
++    case 19:
+     case ScalarColumnType.BPCHAR:
+     case ScalarColumnType.TEXT:
+     case ScalarColumnType.VARCHAR:

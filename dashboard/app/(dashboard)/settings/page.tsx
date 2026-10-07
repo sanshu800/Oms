@@ -3,7 +3,7 @@
 import { useAuth } from "@/lib/auth-context";
 import { Card, CardHeader, PageHeader, StatusBadge } from "@/components/ui";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
+const API_URL = "/api";
 
 export default function SettingsPage() {
   const { tenant, stores } = useAuth();

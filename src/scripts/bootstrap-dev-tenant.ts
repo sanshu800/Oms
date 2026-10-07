@@ -1,6 +1,15 @@
 ﻿import { PrismaClient } from "@prisma/client";
 
-const prisma = new PrismaClient();
+import {
+  createPrismaAdapter,
+  databaseUrlFromEnv,
+} from "../prisma/prisma-adapter";
+
+// Admin script: connects as the schema owner so it can cross tenant
+// boundaries the same way a migration would.
+const prisma = new PrismaClient({
+  adapter: createPrismaAdapter(databaseUrlFromEnv(["DATABASE_URL", "APP_DATABASE_URL"])),
+});
 
 async function main() {
   const existing = await prisma.tenant.findFirst({

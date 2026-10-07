@@ -1,0 +1,10 @@
+{
+  "id": 5500000999,
+  "name": "#1001",
+  "domain": "techmart-lab.myshopify.com",
+  "myshopify_domain": "techmart-lab.myshopify.com",
+  "email": "owner@example.com",
+  "currency": "USD",
+  "created_at": "2026-10-07T09:00:00-04:00",
+  "updated_at": "2026-10-07T10:00:00-04:00"
+}

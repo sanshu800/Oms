@@ -9,6 +9,8 @@ import { Spinner } from "@/components/ui";
 
 const NAV_ITEMS = [
   { href: "/", label: "Overview", icon: OverviewIcon },
+  { href: "/orders", label: "Orders", icon: OrdersIcon },
+  { href: "/inventory", label: "Inventory", icon: InventoryIcon },
   { href: "/exceptions", label: "Exceptions", icon: ExceptionIcon },
   { href: "/proposals", label: "AI Proposals", icon: ProposalIcon },
   { href: "/autonomy", label: "Autonomy", icon: AutonomyIcon },
@@ -123,6 +125,25 @@ function OverviewIcon({ active }: { active?: boolean }) {
       <rect x="14" y="3" width="7" height="5" rx="1.5" />
       <rect x="14" y="12" width="7" height="9" rx="1.5" />
       <rect x="3" y="16" width="7" height="5" rx="1.5" />
+    </svg>
+  );
+}
+
+function OrdersIcon({ active }: { active?: boolean }) {
+  return (
+    <svg {...iconProps(active)}>
+      <path d="M8 4h8l2 2v14H6V6l2-2Z" />
+      <path d="M9 4v4h6V4M9 12h6M9 16h4" />
+    </svg>
+  );
+}
+
+function InventoryIcon({ active }: { active?: boolean }) {
+  return (
+    <svg {...iconProps(active)}>
+      <path d="M3 20h18M5 20V7l7-4 7 4v13" />
+      <path d="M8 10h8M8 14h8M8 18h8" />
+      <path d="M10 10v4M14 14v4" />
     </svg>
   );
 }
