@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.next/
+out/
+.env
+.env*.local
+.env.production
+.env.development
+coverage/
+generated/
+*.log
+*.bak
+*.backup
+*.backup.*
