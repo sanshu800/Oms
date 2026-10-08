@@ -13,9 +13,9 @@ async function bootstrap() {
     { rawBody: true },
   );
 
-  // The merchant dashboard is a separate app (its own origin/port),
-  // authenticated via a Bearer API key rather than cookies — CORS
-  // just needs to let the browser make the request at all.
+  // The operator frontend (when present) is a separate app (its own
+  // origin/port), authenticated via a Bearer API key rather than cookies —
+  // CORS just needs to let the browser make the request at all.
   app.enableCors({
     origin: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
