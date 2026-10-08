@@ -22,7 +22,7 @@ async function main() {
       tenantId: true,
       platform: true,
       externalStoreId: true,
-      shopDomain: true,
+      externalStoreId: true,
       status: true,
     },
   });

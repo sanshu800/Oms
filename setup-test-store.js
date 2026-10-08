@@ -27,7 +27,7 @@ async function main() {
 
   const store = await prisma.storeConnection.upsert({
     where: {
-      shopDomain: "test.myshopify.com",
+      platform_externalStoreId: { platform: "SHOPIFY", externalStoreId: "test.myshopify.com" },
     },
     update: {
       tenantId: tenant.id,
@@ -40,7 +40,7 @@ async function main() {
       tenantId: tenant.id,
       platform: "SHOPIFY",
       externalStoreId: STORE_ID,
-      shopDomain: "test.myshopify.com",
+      externalStoreId: "test.myshopify.com",
       status: "ACTIVE",
     },
   });
@@ -61,7 +61,7 @@ async function main() {
           tenantId: store.tenantId,
           platform: store.platform,
           externalStoreId: store.externalStoreId,
-          shopDomain: store.shopDomain,
+          externalStoreId: store.externalStoreId,
           status: store.status,
         },
       },

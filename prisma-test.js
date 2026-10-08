@@ -6,7 +6,7 @@ const p = new PrismaClient();
 
 p.storeConnection.findUnique({
   where: {
-    shopDomain: "test.myshopify.com"
+    platform_externalStoreId: { platform: "SHOPIFY", externalStoreId: "test.myshopify.com" }
   }
 })
 .then(function (x) {

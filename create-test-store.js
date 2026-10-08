@@ -12,7 +12,7 @@ async function main() {
 
   const store = await p.storeConnection.upsert({
     where: {
-      shopDomain: "test.myshopify.com"
+      platform_externalStoreId: { platform: "SHOPIFY", externalStoreId: "test.myshopify.com" },
     },
     update: {
       status: "ACTIVE"
@@ -20,7 +20,7 @@ async function main() {
     create: {
       tenantId: tenant.id,
       platform: "SHOPIFY",
-      shopDomain: "test.myshopify.com",
+      externalStoreId: "test.myshopify.com",
       status: "ACTIVE",
       scopes: []
     }

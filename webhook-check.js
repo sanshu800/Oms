@@ -10,7 +10,7 @@ async function main() {
     select: {
       id: true,
       storeId: true,
-      shopifyEventId: true,
+      externalEventId: true,
       topic: true,
       status: true,
       attempts: true,
