@@ -168,7 +168,12 @@ export class ShopifyAuthService {
     // exists, is inherently a cross-tenant lookup.
     const store = await this.prisma.runAsSystem(() =>
       this.prisma.storeConnection.findUnique({
-        where: { shopDomain: shop.toLowerCase() },
+        where: {
+          platform_externalStoreId: {
+            platform: StorePlatform.SHOPIFY,
+            externalStoreId: shop.toLowerCase(),
+          },
+        },
       }),
     );
 
@@ -357,7 +362,12 @@ export class ShopifyAuthService {
     // system — it runs before any tenant context can exist by definition.
     return this.prisma.runAsSystem(async () => {
       const existing = await this.prisma.storeConnection.findUnique({
-        where: { shopDomain: shop },
+        where: {
+          platform_externalStoreId: {
+            platform: StorePlatform.SHOPIFY,
+            externalStoreId: shop,
+          },
+        },
         select: { tenantId: true },
       });
 
@@ -390,12 +400,15 @@ export class ShopifyAuthService {
 
       const store = await this.prisma.storeConnection.upsert({
         where: {
-          shopDomain: shop,
+          platform_externalStoreId: {
+            platform: StorePlatform.SHOPIFY,
+            externalStoreId: shop,
+          },
         },
         create: {
           tenantId,
           platform: StorePlatform.SHOPIFY,
-          shopDomain: shop,
+          externalStoreId: shop,
           status: StoreConnectionStatus.ACTIVE,
           encryptedAccessToken,
           scopes,
@@ -413,7 +426,7 @@ export class ShopifyAuthService {
         },
         select: {
           id: true,
-          shopDomain: true,
+          externalStoreId: true,
           status: true,
           scopes: true,
           installedAt: true,

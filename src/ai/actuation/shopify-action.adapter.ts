@@ -225,7 +225,7 @@ export class ShopifyActionAdapter implements ActionAdapter {
 
     const accessToken = decryptSecret(store.encryptedAccessToken, encryptionKey);
 
-    return { shopDomain: store.shopDomain, accessToken };
+    return { shopDomain: store.externalStoreId, accessToken };
   }
 
   private async graphQl<T>(

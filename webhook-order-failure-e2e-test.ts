@@ -50,12 +50,15 @@ async function main() {
     const store =
       await prisma.storeConnection.findUnique({
         where: {
-          shopDomain: "techmart-lab.myshopify.com",
+          platform_externalStoreId: {
+            platform: "SHOPIFY",
+            externalStoreId: "techmart-lab.myshopify.com",
+          },
         },
         select: {
           id: true,
           tenantId: true,
-          shopDomain: true,
+          externalStoreId: true,
         },
       });
 
@@ -145,7 +148,7 @@ async function main() {
     console.log(
       JSON.stringify(
         {
-          store: store.shopDomain,
+          store: store.externalStoreId,
           tenantId: store.tenantId,
           storeId: store.id,
           sku: inventoryItem.sku,
@@ -175,7 +178,7 @@ async function main() {
           "x-shopify-hmac-sha256":
             signature,
           "x-shopify-shop-domain":
-            store.shopDomain,
+            store.externalStoreId,
           "x-shopify-webhook-id":
             shopifyEventId,
           "x-shopify-topic":
@@ -301,9 +304,9 @@ async function main() {
     const webhookEvent =
       await prisma.webhookEvent.findUnique({
         where: {
-          storeId_shopifyEventId: {
+          storeId_externalEventId: {
             storeId: store.id,
-            shopifyEventId,
+            externalEventId: shopifyEventId,
           },
         },
       });

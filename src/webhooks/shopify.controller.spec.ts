@@ -2,6 +2,7 @@ import { BadRequestException } from "@nestjs/common";
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { ShopifyConnector } from "../connectors/shopify/shopify.connector";
 import { ShopifyController } from "./shopify.controller";
 import { WebhookIntakeService } from "./webhook-intake.service";
 
@@ -15,43 +16,55 @@ describe("ShopifyController", () => {
   const delivery = {
     webhookEventId: "event-1",
     shouldEnqueue: true,
+    resetForRetry: false,
   };
 
   const intake = {
-    recordShopifyDelivery: vi.fn().mockResolvedValue(delivery),
+    recordDelivery: vi.fn().mockResolvedValue(delivery),
     enqueueForProcessing: vi.fn().mockResolvedValue(undefined),
   } as unknown as WebhookIntakeService;
+
+  const connector = new ShopifyConnector({} as never, {} as never);
 
   let controller: ShopifyController;
 
   beforeEach(() => {
     vi.clearAllMocks();
-    controller = new ShopifyController(intake);
+    (intake.recordDelivery as ReturnType<typeof vi.fn>).mockResolvedValue(
+      delivery,
+    );
+    controller = new ShopifyController(intake, connector);
   });
 
   const call = (overrides: Record<string, unknown> = {}) => {
-    const headers = {
-      signature: "signature",
-      shopDomain: "techmart-lab.myshopify.com",
-      webhookId: "wh-1",
-      topic: "orders/create",
-      request: { rawBody: Buffer.from(JSON.stringify({ id: 1 })) },
-      ...overrides,
-    } as {
-      signature?: string;
-      shopDomain?: string;
-      webhookId?: string;
-      topic?: string;
-      request: { rawBody?: Buffer };
+    const request = {
+      rawBody: Buffer.from(JSON.stringify({ id: 1 })),
+      ...(overrides.request as object | undefined),
+    } as { rawBody?: Buffer };
+
+    const headers: Record<string, string | undefined> = {
+      "x-shopify-hmac-sha256": "signature",
+      "x-shopify-shop-domain": "techmart-lab.myshopify.com",
+      "x-shopify-webhook-id": "wh-1",
+      "x-shopify-topic": "orders/create",
     };
 
-    return controller.handleShopifyWebhook(
-      headers.request as never,
-      headers.signature,
-      headers.shopDomain,
-      headers.webhookId,
-      headers.topic,
-    );
+    for (const [key, value] of Object.entries(overrides)) {
+      if (key === "request") continue;
+      const headerName =
+        key === "signature"
+          ? "x-shopify-hmac-sha256"
+          : key === "shopDomain"
+            ? "x-shopify-shop-domain"
+            : key === "webhookId"
+              ? "x-shopify-webhook-id"
+              : key === "topic"
+                ? "x-shopify-topic"
+                : key;
+      headers[headerName] = value as string | undefined;
+    }
+
+    return controller.handleShopifyWebhook(request as never, headers);
   };
 
   it("accepts a well-formed delivery and reports the stored event", async () => {
@@ -61,12 +74,14 @@ describe("ShopifyController", () => {
       duplicate: false,
     });
 
-    expect(intake.recordShopifyDelivery).toHaveBeenCalledWith(
+    expect(intake.recordDelivery).toHaveBeenCalledWith(
       expect.objectContaining({
-        shopDomain: "techmart-lab.myshopify.com",
-        webhookId: "wh-1",
-        topic: "orders/create",
-        signature: "signature",
+        connector,
+        envelope: {
+          storeKey: "techmart-lab.myshopify.com",
+          externalEventId: "wh-1",
+          topic: "orders/create",
+        },
         payload: { id: 1 },
       }),
     );
@@ -82,13 +97,14 @@ describe("ShopifyController", () => {
         "Shopify delivers webhooks to this URL with POST. A browser GET is not a delivery.",
       expectedMethod: "POST",
     });
-    expect(intake.recordShopifyDelivery).not.toHaveBeenCalled();
+    expect(intake.recordDelivery).not.toHaveBeenCalled();
   });
 
   it("reports a duplicate delivery without re-queueing", async () => {
-    (intake.recordShopifyDelivery as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+    (intake.recordDelivery as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
       webhookEventId: "event-1",
       shouldEnqueue: false,
+      resetForRetry: false,
     });
 
     await expect(call()).resolves.toEqual({
@@ -96,6 +112,9 @@ describe("ShopifyController", () => {
       webhookEventId: "event-1",
       duplicate: true,
     });
+    expect(intake.enqueueForProcessing).toHaveBeenCalledWith(
+      expect.objectContaining({ shouldEnqueue: false }),
+    );
   });
 
   it.each([
@@ -104,7 +123,7 @@ describe("ShopifyController", () => {
     ["topic", { topic: undefined }],
   ])("rejects a delivery missing the %s header", async (_label, headers) => {
     await expect(call(headers)).rejects.toBeInstanceOf(BadRequestException);
-    expect(intake.recordShopifyDelivery).not.toHaveBeenCalled();
+    expect(intake.recordDelivery).not.toHaveBeenCalled();
   });
 
   it("rejects a request whose raw body was not captured", async () => {
@@ -117,5 +136,6 @@ describe("ShopifyController", () => {
     await expect(
       call({ request: { rawBody: Buffer.from("not json") } }),
     ).rejects.toBeInstanceOf(BadRequestException);
+    expect(intake.recordDelivery).not.toHaveBeenCalled();
   });
 });

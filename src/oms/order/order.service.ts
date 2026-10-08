@@ -1,11 +1,25 @@
 import { Injectable } from '@nestjs/common';
 import { OrderStatus, Prisma } from '@prisma/client';
 
+import {
+  NormalizedOrder,
+  NormalizedOrderLine,
+} from '../../connectors/connector.interface';
 import { PrismaService } from '../../prisma/prisma.service';
 import { InventoryService } from '../inventory/inventory.service';
 import { OrderFailureExceptionService } from './order-failure-exception.service';
 import { OrderBusinessFailureError } from './order-business-failure.error';
 import { assertOrderTransition } from './order-lifecycle';
+
+/** Line shape used internally after decimal conversion. */
+type OrderLineDraft = {
+  externalLineItemId: string;
+  externalItemRef: string | null;
+  sku: string;
+  title: string;
+  quantity: number;
+  unitPrice?: Prisma.Decimal;
+};
 
 @Injectable()
 export class OrderService {
@@ -15,47 +29,40 @@ export class OrderService {
     private readonly orderFailureExceptionService: OrderFailureExceptionService,
   ) {}
 
-  async upsertFromShopify(input: {
+  /**
+   * The only way channel order events enter canonical order logic
+   * (locked decision 2): the channel connector has already parsed and
+   * validated the payload into a NormalizedOrder (decision 3 — this
+   * service contains zero channel payload parsing).
+   */
+  async upsertFromChannel(input: {
     tenantId: string;
     storeId: string;
-    payload: unknown;
-    topic?: "orders/create" | "orders/updated" | "orders/cancelled";
+    order: NormalizedOrder;
   }) {
-    const payload = this.requireShopifyObject(input.payload);
-    const topic = input.topic ?? "orders/create";
-    const isCancelled = topic === "orders/cancelled" || Boolean(payload.cancelled_at);
+    const normalized = input.order;
 
-    const externalOrderId = this.requireShopifyString(
-      payload.id,
-      "order.id",
+    const externalOrderId = normalized.externalOrderId;
+    const orderNumber = normalized.orderNumber;
+    const isCancelled = normalized.cancelled;
+    const paymentStatus = normalized.paymentStatus;
+    const fulfillmentStatus = normalized.fulfillmentStatus;
+    const totalPrice = normalized.totalAmount;
+    const currency = normalized.currency;
+    const orderedAt = normalized.orderedAt;
+    const lineItems: OrderLineDraft[] | undefined = normalized.lines?.map(
+      (line: NormalizedOrderLine) => ({
+        externalLineItemId: line.externalLineItemId,
+        externalItemRef: line.externalItemRef,
+        sku: line.sku,
+        title: line.title,
+        quantity: line.quantity,
+        unitPrice:
+          line.unitPrice !== null
+            ? new Prisma.Decimal(line.unitPrice)
+            : undefined,
+      }),
     );
-    const orderNumber = this.requireShopifyString(
-      payload.name,
-      "order.name",
-    );
-    const paymentStatus = this.requireShopifyString(
-      payload.financial_status,
-      "order.financial_status",
-    );
-    const fulfillmentStatus =
-      typeof payload.fulfillment_status === "string"
-        ? payload.fulfillment_status
-        : "unfulfilled";
-    const totalPrice = this.requireShopifyString(
-      payload.total_price,
-      "order.total_price",
-    );
-    const currency = this.requireShopifyString(
-      payload.currency,
-      "order.currency",
-    );
-    const orderedAt = this.requireShopifyDate(
-      payload.created_at,
-      "order.created_at",
-    );
-    const lineItems = Array.isArray(payload.line_items)
-      ? this.parseLineItems(payload.line_items)
-      : undefined;
 
     const existing = await this.prisma.order.findUnique({
       where: {
@@ -77,8 +84,9 @@ export class OrderService {
     });
 
     if (existing) {
-      // Shopify may deliver an older update after the cancellation event.
-      // Preserve the complete terminal OMS snapshot, not just its status.
+      // The channel may deliver an older update after the cancellation
+      // event. Preserve the complete terminal OMS snapshot, not just its
+      // status.
       if (existing.status === OrderStatus.CANCELLED && !isCancelled) {
         return this.prisma.order.findUniqueOrThrow({
           where: { id: existing.id },
@@ -132,7 +140,7 @@ export class OrderService {
         );
 
         if (inventoryChanged && !hasCommittedInventory) {
-          // Release first, then reconcile and reserve the current Shopify
+          // Release first, then reconcile and reserve the current channel
           // snapshot. This makes quantity reductions/removals free stock.
           await this.inventoryService.releaseOrder({
             tenantId: input.tenantId,
@@ -143,7 +151,7 @@ export class OrderService {
           shouldReserve = true;
         } else {
           // Never rewrite SKU/quantity after a reservation has been committed
-          // to fulfillment. Shopify may still update descriptions or prices.
+          // to fulfillment. The channel may still update descriptions or prices.
           await this.syncLineItems(
             existing.id,
             existing.items,
@@ -154,8 +162,8 @@ export class OrderService {
       }
 
       // If an earlier allocation attempt failed transiently, retry when the
-      // persisted order still has unreserved quantity, even if Shopify sends
-      // the same line-item snapshot on its retry/update event.
+      // persisted order still has unreserved quantity, even if the channel
+      // sends the same line-item snapshot on its retry/update event.
       if (
         !shouldReserve &&
         !hasCommittedInventory &&
@@ -432,13 +440,7 @@ export class OrderService {
       sku: string;
       quantity: number;
     }>,
-    desiredItems: Array<{
-      externalLineItemId: string;
-      sku: string;
-      title: string;
-      quantity: number;
-      unitPrice?: Prisma.Decimal;
-    }>,
+    desiredItems: OrderLineDraft[],
     includeInventoryFields: boolean,
   ): Promise<void> {
     const existingByExternalId = new Map(
@@ -457,6 +459,7 @@ export class OrderService {
           data: {
             orderId,
             externalLineItemId: item.externalLineItemId,
+            externalItemRef: item.externalItemRef,
             sku: item.sku,
             title: item.title,
             quantity: item.quantity,
@@ -474,6 +477,9 @@ export class OrderService {
           ...(includeInventoryFields
             ? {
                 sku: item.sku,
+                ...(item.externalItemRef
+                  ? { externalItemRef: item.externalItemRef }
+                  : {}),
                 quantity: item.quantity,
                 ...(existing.sku !== item.sku
                   ? { inventoryItemId: null }
@@ -504,123 +510,4 @@ export class OrderService {
     }
   }
 
-  private requireShopifyObject(value: unknown): Record<string, unknown> {
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw new Error("Shopify order payload must be an object");
-    }
-
-    return value as Record<string, unknown>;
-  }
-
-  private parseLineItems(value: unknown): Array<{
-    externalLineItemId: string;
-    sku: string;
-    title: string;
-    quantity: number;
-    unitPrice?: Prisma.Decimal;
-  }> {
-    if (!Array.isArray(value)) {
-      return [];
-    }
-
-    const externalLineItemIds = new Set<string>();
-    return value.map((rawItem, index) => {
-      const item = rawItem as Record<string, unknown>;
-
-      const externalLineItemId = this.requireShopifyString(
-        item.id,
-        `order.line_items[${index}].id`,
-      );
-      if (externalLineItemIds.has(externalLineItemId)) {
-        throw new Error(
-          `Duplicate Shopify line item ID: ${externalLineItemId}`,
-        );
-      }
-      externalLineItemIds.add(externalLineItemId);
-
-      const sku =
-        typeof item.sku === 'string' &&
-        item.sku.trim() !== ''
-          ? item.sku.trim()
-          : this.requireShopifyString(
-              item.variant_id,
-              `order.line_items[${index}].variant_id`,
-            );
-
-      const title =
-        typeof item.title === 'string' &&
-        item.title.trim() !== ''
-          ? item.title.trim()
-          : sku;
-
-      const quantity = Number(item.quantity);
-
-      if (!Number.isInteger(quantity) || quantity <= 0) {
-        throw new Error(
-          `Invalid quantity for order.line_items[${index}]`,
-        );
-      }
-
-      const price =
-        typeof item.price === 'string' ||
-        typeof item.price === 'number'
-          ? new Prisma.Decimal(String(item.price))
-          : undefined;
-
-      return {
-        externalLineItemId,
-        sku,
-        title,
-        quantity,
-        unitPrice: price,
-      };
-    });
-  }
-
-  private requireShopifyString(
-    value: unknown,
-    field: string,
-  ): string {
-    if (
-      (typeof value !== 'string' &&
-        typeof value !== 'number') ||
-      String(value).trim() === ''
-    ) {
-      throw new Error(
-        `Missing required Shopify field: ${field}`,
-      );
-    }
-
-    return String(value);
-  }
-
-  private requireShopifyDate(
-    value: unknown,
-    field: string,
-  ): Date {
-    if (
-      typeof value !== 'string' ||
-      value.trim() === ''
-    ) {
-      throw new Error(
-        `Missing required Shopify field: ${field}`,
-      );
-    }
-
-    const date = new Date(value);
-
-    if (Number.isNaN(date.getTime())) {
-      throw new Error(
-        `Invalid Shopify date: ${field}`,
-      );
-    }
-
-    return date;
-  }
 }
-
-
-
-
-
-

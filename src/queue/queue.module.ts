@@ -3,6 +3,7 @@ import { ConfigService } from "@nestjs/config";
 import { BullModule } from "@nestjs/bullmq";
 
 import { PrismaModule } from "../prisma/prisma.module";
+import { ConnectorsModule } from "../connectors/connectors.module";
 import { OrderModule } from "../oms/order/order.module";
 import { AuditModule } from "../oms/audit/audit.module";
 import { ExceptionModule } from "../oms/exception/exception.module";
@@ -20,6 +21,7 @@ import { parseRedisConnectionOptions } from "../config/redis-connection";
 @Module({
   imports: [
     PrismaModule,
+    ConnectorsModule,
     OrderModule,
     AuditModule,
     ExceptionModule,

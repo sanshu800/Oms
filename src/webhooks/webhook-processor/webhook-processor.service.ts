@@ -1,4 +1,4 @@
-import { Injectable, Logger } from "@nestjs/common";
+import { Inject, Injectable, Logger } from "@nestjs/common";
 import {
   AuditActorType,
   ExceptionSeverity,
@@ -7,8 +7,11 @@ import {
   WebhookStatus,
 } from "@prisma/client";
 
-import { isComplianceRestTopic } from "../../shopify/webhook-registration";
-
+import {
+  ChannelConnector,
+  CHANNEL_CONNECTORS,
+  connectorForPlatform,
+} from "../../connectors/connector.interface";
 import { PrismaService } from "../../prisma/prisma.service";
 import { OrderService } from "../../oms/order/order.service";
 import { AuditService } from "../../oms/audit/audit.service";
@@ -31,6 +34,8 @@ export class WebhookProcessorService {
     private readonly auditService: AuditService,
     private readonly exceptionService: ExceptionService,
     private readonly resolutionService: ResolutionService,
+    @Inject(CHANNEL_CONNECTORS)
+    private readonly connectors: readonly ChannelConnector[],
   ) {}
 
   async processEvent(
@@ -92,7 +97,7 @@ export class WebhookProcessorService {
       tenantId: string;
       storeId: string;
       topic: string;
-      shopifyEventId: string;
+      externalEventId: string;
       payload: unknown;
     },
     options: WebhookProcessingOptions,
@@ -108,16 +113,33 @@ export class WebhookProcessorService {
       entityId: event.id,
       metadata: {
         topic: event.topic,
-        shopifyEventId: event.shopifyEventId,
+        externalEventId: event.externalEventId,
         attempt: options.attempt,
         maxAttempts: options.maxAttempts,
       },
     });
 
     try {
+      const store = await this.prisma.storeConnection.findUnique({
+        where: { id: event.storeId },
+        select: { platform: true, status: true },
+      });
+
+      if (!store) {
+        throw new Error(
+          `Store connection not found for webhook event: ${event.id}`,
+        );
+      }
+
+      // All channel-specific vocabulary (topics, payloads, snapshots)
+      // lives behind the connector (locked decision 1). The processor
+      // switches on semantic intents only.
+      const connector = connectorForPlatform(this.connectors, store.platform);
+      const intent = connector.mapTopic(event.topic);
+
       // Store lifecycle first: everything else assumes a live connection
       // with a valid access token.
-      if (event.topic === "app/uninstalled") {
+      if (intent.kind === "STORE_DISCONNECTED") {
         await this.handleStoreUninstalled(event);
         return;
       }
@@ -125,19 +147,14 @@ export class WebhookProcessorService {
       // Privacy requests are answered before the store-status check below:
       // a merchant who uninstalled still has 30 days of data rights, and
       // Shopify keeps delivering these topics after the install is gone.
-      if (isComplianceRestTopic(event.topic)) {
+      if (intent.kind === "PRIVACY_REQUEST") {
         await this.handleComplianceRequest(event);
         return;
       }
 
-      const store = await this.prisma.storeConnection.findUnique({
-        where: { id: event.storeId },
-        select: { status: true },
-      });
-
       // A disconnected store's deliveries (uninstall, then any in-flight
       // order events) must not be processed against a dead connection.
-      if (store && store.status !== StoreConnectionStatus.ACTIVE) {
+      if (store.status !== StoreConnectionStatus.ACTIVE) {
         await this.prisma.webhookEvent.update({
           where: { id: event.id },
           data: {
@@ -167,13 +184,7 @@ export class WebhookProcessorService {
         return;
       }
 
-      const supportedOrderTopics = [
-        "orders/create",
-        "orders/updated",
-        "orders/cancelled",
-      ];
-
-      if (!supportedOrderTopics.includes(event.topic)) {
+      if (intent.kind === "IGNORED") {
         await this.prisma.webhookEvent.update({
           where: {
             id: event.id,
@@ -194,14 +205,14 @@ export class WebhookProcessorService {
           entityId: event.id,
           metadata: {
             topic: event.topic,
-            reason: "Unsupported webhook topic",
+            reason: intent.reason,
           },
         });
 
         return;
       }
 
-      const order = await this.processOrderWebhook(event);
+      const order = await this.processOrderWebhook(event, connector);
 
       await this.prisma.webhookEvent.update({
         where: {
@@ -223,7 +234,7 @@ export class WebhookProcessorService {
         entityId: event.id,
         metadata: {
           topic: event.topic,
-          shopifyEventId: event.shopifyEventId,
+          externalEventId: event.externalEventId,
           orderId: order.id,
           externalOrderId: order.externalOrderId,
         },
@@ -239,7 +250,7 @@ export class WebhookProcessorService {
         metadata: {
           source: "shopify",
           webhookEventId: event.id,
-          shopifyEventId: event.shopifyEventId,
+          externalEventId: event.externalEventId,
           externalOrderId: order.externalOrderId,
           orderNumber: order.orderNumber,
           status: order.status,
@@ -269,7 +280,7 @@ export class WebhookProcessorService {
           entityId: event.id,
           metadata: {
             topic: event.topic,
-            shopifyEventId: event.shopifyEventId,
+            externalEventId: event.externalEventId,
             error: error.message,
             exceptionId: error.exceptionId,
             orderId: error.orderId,
@@ -343,13 +354,13 @@ export class WebhookProcessorService {
       await this.exceptionService.createOrUpdateException({
         tenantId: event.tenantId,
         storeId: event.storeId,
-        fingerprint: `WEBHOOK:${event.storeId}:${event.topic}:${event.shopifyEventId}`,
+        fingerprint: `WEBHOOK:${event.storeId}:${event.topic}:${event.externalEventId}`,
         category: "WEBHOOK_PROCESSING",
         severity: ExceptionSeverity.HIGH,
         title: `Shopify webhook processing failed: ${event.topic}`,
         evidence: {
           webhookEventId: event.id,
-          shopifyEventId: event.shopifyEventId,
+          externalEventId: event.externalEventId,
           topic: event.topic,
           error: message,
           attempt: options.attempt,
@@ -372,7 +383,7 @@ export class WebhookProcessorService {
         entityId: event.id,
         metadata: {
           topic: event.topic,
-          shopifyEventId: event.shopifyEventId,
+          externalEventId: event.externalEventId,
           error: message,
           attempt: options.attempt,
           maxAttempts: options.maxAttempts,
@@ -502,101 +513,35 @@ export class WebhookProcessorService {
     );
   }
 
-  private async processOrderWebhook(event: {
-    id: string;
-    tenantId: string;
-    storeId: string;
-    topic: string;
-    shopifyEventId: string;
-    payload: unknown;
-  }) {
-    const payload = event.payload as Record<string, unknown>;
-
-    const shopifyOrderId = this.requireShopifyId(payload.id, "order.id");
-
-    const orderName =
-      typeof payload.name === "string" ? payload.name : shopifyOrderId;
-
-    const financialStatus =
-      typeof payload.financial_status === "string"
-        ? payload.financial_status
-        : "unknown";
-
-    const fulfillmentStatus =
-      typeof payload.fulfillment_status === "string"
-        ? payload.fulfillment_status
-        : "unfulfilled";
-
-    const createdAtShopify = this.requireDate(
-      payload.created_at,
-      "order.created_at",
-    );
-
-    const updatedAtShopify = this.requireDate(
-      payload.updated_at,
-      "order.updated_at",
-    );
-
-    await this.prisma.shopifyOrderSnapshot.upsert({
-      where: {
-        storeId_shopifyOrderId: {
-          storeId: event.storeId,
-          shopifyOrderId,
-        },
-      },
-      create: {
+  private async processOrderWebhook(
+    event: {
+      id: string;
+      tenantId: string;
+      storeId: string;
+      topic: string;
+      externalEventId: string;
+      payload: unknown;
+    },
+    connector: ChannelConnector,
+  ) {
+    // The channel-private raw snapshot is written before canonical
+    // processing, exactly as before, but its parsing and payload shape
+    // belong to the connector.
+    if (connector.recordRawSnapshot) {
+      await connector.recordRawSnapshot({
         tenantId: event.tenantId,
         storeId: event.storeId,
-        shopifyOrderId,
-        orderName,
-        financialStatus,
-        fulfillmentStatus,
-        raw: payload as any,
-        createdAtShopify,
-        updatedAtShopify,
-      },
-      update: {
-        orderName,
-        financialStatus,
-        fulfillmentStatus,
-        raw: payload as any,
-        updatedAtShopify,
-      },
-    });
+        payload: event.payload,
+      });
+    }
 
-    return this.orderService.upsertFromShopify({
+    return this.orderService.upsertFromChannel({
       tenantId: event.tenantId,
       storeId: event.storeId,
-      topic: event.topic as "orders/create" | "orders/updated" | "orders/cancelled",
-      payload,
+      order: connector.normalizeOrder({
+        topic: event.topic,
+        payload: event.payload,
+      }),
     });
   }
-
-  private requireShopifyId(value: unknown, field: string): string {
-    if (
-      (typeof value !== "string" && typeof value !== "number") ||
-      String(value).trim() === ""
-    ) {
-      throw new Error(`Missing required Shopify field: ${field}`);
-    }
-
-    return String(value);
-  }
-
-  private requireDate(value: unknown, field: string): Date {
-    if (typeof value !== "string" && !(value instanceof Date)) {
-      throw new Error(`Missing required Shopify field: ${field}`);
-    }
-
-    const date = new Date(value);
-
-    if (Number.isNaN(date.getTime())) {
-      throw new Error(`Invalid Shopify date: ${field}`);
-    }
-
-    return date;
-  }
 }
-
-
-

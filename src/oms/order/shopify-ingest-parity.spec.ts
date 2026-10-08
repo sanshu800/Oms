@@ -4,6 +4,7 @@ vi.mock("@prisma/client", () => import("../../../test-utils/prisma-client.mock")
 
 import { Prisma } from "@prisma/client";
 
+import { ShopifyConnector } from "../../connectors/shopify/shopify.connector";
 import { OrderService } from "./order.service";
 
 /**
@@ -67,11 +68,20 @@ describe("Shopify ingest parity", () => {
   });
 
   async function ingest(input: { payload: unknown; topic?: string }) {
-    return (service as any).upsertFromShopify({
+    // Stage B of the connector refactor: the SAME payloads now flow
+    // through ShopifyConnector.normalizeOrder into upsertFromChannel.
+    // Every expectation below is byte-for-byte what Stage A locked
+    // against the old upsertFromShopify implementation.
+    const connector = new ShopifyConnector({} as never, {} as never);
+    const order = connector.normalizeOrder({
+      topic: input.topic ?? "orders/create",
+      payload: input.payload,
+    });
+
+    return service.upsertFromChannel({
       tenantId: "tenant-1",
       storeId: "store-1",
-      payload: input.payload,
-      topic: input.topic ?? "orders/create",
+      order,
     });
   }
 
@@ -115,7 +125,7 @@ describe("Shopify ingest parity", () => {
       }),
     );
 
-    const createArgs = prisma.order.create.mock.calls[0][0] as any;
+    const createArgs = prisma.order.create.mock.calls[0]![0] as any;
     expect(String(createArgs.data.totalAmount)).toBe("59.90");
     expect(createArgs.data.totalAmount).toBeInstanceOf(Prisma.Decimal);
   });
@@ -123,7 +133,7 @@ describe("Shopify ingest parity", () => {
   it("maps line items to order items exactly (id, sku, title, quantity, price)", async () => {
     await ingest({ payload: shopifyPayload });
 
-    const createArgs = prisma.order.create.mock.calls[0][0] as any;
+    const createArgs = prisma.order.create.mock.calls[0]![0] as any;
     expect(createArgs.data.items.create).toHaveLength(1);
 
     const line = createArgs.data.items.create[0];
@@ -152,7 +162,7 @@ describe("Shopify ingest parity", () => {
       },
     });
 
-    const line = (prisma.order.create.mock.calls[0][0] as any).data.items
+    const line = (prisma.order.create.mock.calls[0]![0] as any).data.items
       .create[0];
     expect(line.sku).toBe("42");
     expect(line.title).toBe("42");
@@ -167,7 +177,7 @@ describe("Shopify ingest parity", () => {
       },
     });
 
-    const createArgs = prisma.order.create.mock.calls[0][0] as any;
+    const createArgs = prisma.order.create.mock.calls[0]![0] as any;
     expect(createArgs.data.status).toBe("CANCELLED");
     expect(inventoryService.reserveOrder).not.toHaveBeenCalled();
     expect(inventoryService.releaseOrder).not.toHaveBeenCalled();
@@ -176,7 +186,7 @@ describe("Shopify ingest parity", () => {
   it("treats the orders/cancelled topic as cancellation even without cancelled_at", async () => {
     await ingest({ payload: shopifyPayload, topic: "orders/cancelled" });
 
-    const createArgs = prisma.order.create.mock.calls[0][0] as any;
+    const createArgs = prisma.order.create.mock.calls[0]![0] as any;
     expect(createArgs.data.status).toBe("CANCELLED");
     expect(inventoryService.reserveOrder).not.toHaveBeenCalled();
   });
@@ -199,7 +209,7 @@ describe("Shopify ingest parity", () => {
       },
     });
 
-    const createArgs = prisma.order.create.mock.calls[0][0] as any;
+    const createArgs = prisma.order.create.mock.calls[0]![0] as any;
     expect(createArgs.data.externalOrderId).toBe("12345");
     expect(String(createArgs.data.totalAmount)).toBe("59.9");
     expect(String(createArgs.data.items.create[0].unitPrice)).toBe("19.95");

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@prisma/client", () => import("../../../test-utils/prisma-client.mock"));
 
+import { ShopifyConnector } from "../../connectors/shopify/shopify.connector";
 import { WebhookProcessorService } from "./webhook-processor.service";
 
 /**
@@ -28,7 +29,7 @@ describe("Shopify order snapshot parity", () => {
   };
 
   const orderService = {
-    upsertFromShopify: vi.fn(),
+    upsertFromChannel: vi.fn(),
   };
 
   const auditService = { recordEvent: vi.fn() };
@@ -62,7 +63,7 @@ describe("Shopify order snapshot parity", () => {
     tenantId: "tenant-1",
     storeId: "store-1",
     topic: "orders/create",
-    shopifyEventId: "shopify-event-1",
+    externalEventId: "shopify-event-1",
     payload,
   };
 
@@ -72,9 +73,12 @@ describe("Shopify order snapshot parity", () => {
     prisma.webhookEvent.updateMany.mockResolvedValue({ count: 1 });
     prisma.webhookEvent.findUnique.mockResolvedValue(baseEvent);
     prisma.webhookEvent.update.mockResolvedValue(baseEvent);
-    prisma.storeConnection.findUnique.mockResolvedValue({ status: "ACTIVE" });
+    prisma.storeConnection.findUnique.mockResolvedValue({
+      platform: "SHOPIFY",
+      status: "ACTIVE",
+    });
     prisma.shopifyOrderSnapshot.upsert.mockResolvedValue({});
-    orderService.upsertFromShopify.mockResolvedValue({
+    orderService.upsertFromChannel.mockResolvedValue({
       id: "order-1",
       externalOrderId: "5500000111",
       orderNumber: "#1001",
@@ -83,12 +87,17 @@ describe("Shopify order snapshot parity", () => {
   });
 
   async function process() {
+    // The real ShopifyConnector runs against the mocked prisma: its
+    // snapshot write lands in the same prisma.shopifyOrderSnapshot.upsert
+    // these tests assert on, byte-for-byte.
+    const connector = new ShopifyConnector(prisma as any, {} as any);
     const service = new WebhookProcessorService(
       prisma as any,
       orderService as any,
       auditService as any,
       exceptionService as any,
       resolutionService as any,
+      [connector],
     );
     return service.processEvent("event-1", { attempt: 1, maxAttempts: 5 });
   }
@@ -134,24 +143,49 @@ describe("Shopify order snapshot parity", () => {
       },
     });
 
-    await process();
+    // This payload has no order.name, so canonical order ingest fails on
+    // it exactly as the pre-refactor OrderService did (same error, after
+    // the snapshot is written). The snapshot defaults themselves are the
+    // behaviour under test.
+    await expect(process()).rejects.toThrow(
+      "Missing required Shopify field: order.name",
+    );
 
-    const args = prisma.shopifyOrderSnapshot.upsert.mock.calls[0][0] as any;
+    const args = prisma.shopifyOrderSnapshot.upsert.mock.calls[0]![0] as any;
     expect(args.create.orderName).toBe("99");
     expect(args.create.financialStatus).toBe("unknown");
     expect(args.create.fulfillmentStatus).toBe("unfulfilled");
     expect(args.create.shopifyOrderId).toBe("99");
   });
 
-  it("passes the untouched payload and topic through to order upsert", async () => {
+  it("passes the normalized order through to canonical upsert", async () => {
     await process();
 
-    expect(orderService.upsertFromShopify).toHaveBeenCalledWith({
+    expect(orderService.upsertFromChannel).toHaveBeenCalledWith({
       tenantId: "tenant-1",
       storeId: "store-1",
-      topic: "orders/create",
-      payload,
+      order: expect.objectContaining({
+        externalOrderId: "5500000111",
+        orderNumber: "#1001",
+        paymentStatus: "paid",
+        fulfillmentStatus: "unfulfilled",
+        cancelled: false,
+      }),
     });
+
+    const orderArg = (orderService.upsertFromChannel as any).mock.calls[0]![0]
+      .order;
+    expect(orderArg.lines).toHaveLength(1);
+    expect(orderArg.lines[0]).toEqual(
+      expect.objectContaining({
+        externalLineItemId: "9000000001",
+        externalItemRef: "44000000001",
+        sku: "SKU-RED-TEE",
+        title: "Red T-Shirt",
+        quantity: 2,
+        unitPrice: "29.95",
+      }),
+    );
   });
 
   it("rejects a snapshot payload without id with the exact error", async () => {

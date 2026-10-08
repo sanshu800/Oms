@@ -13,11 +13,14 @@ async function main() {
 
     const store = await prisma.storeConnection.findUnique({
       where: {
-        shopDomain: "techmart-lab.myshopify.com",
+        platform_externalStoreId: {
+          platform: "SHOPIFY",
+          externalStoreId: "techmart-lab.myshopify.com",
+        },
       },
       select: {
         id: true,
-        shopDomain: true,
+        externalStoreId: true,
         encryptedAccessToken: true,
       },
     });
@@ -80,7 +83,7 @@ async function main() {
     `;
 
     const response = await fetch(
-      `https://${store.shopDomain}/admin/api/2026-07/graphql.json`,
+      `https://${store.externalStoreId}/admin/api/2026-07/graphql.json`,
       {
         method: "POST",
         headers: {
@@ -110,7 +113,7 @@ async function main() {
     console.log(
       JSON.stringify(
         {
-          shopDomain: store.shopDomain,
+          shopDomain: store.externalStoreId,
           result,
         },
         null,

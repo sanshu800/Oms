@@ -119,7 +119,12 @@ async function main() {
   }
 
   const store = await prisma.storeConnection.findUnique({
-    where: { shopDomain: shop },
+    where: {
+      platform_externalStoreId: {
+        platform: "SHOPIFY",
+        externalStoreId: shop,
+      },
+    },
     select: {
       id: true,
       tenantId: true,

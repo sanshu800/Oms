@@ -9,7 +9,7 @@ function buildDeps() {
   const store = {
     id: "store-1",
     tenantId: "tenant-1",
-    shopDomain: "test-shop.myshopify.com",
+    externalStoreId: "test-shop.myshopify.com",
     encryptedAccessToken: encryptSecret("real-token", ENCRYPTION_KEY),
     scopes: ["read_orders", "write_orders"],
     status: "ACTIVE",

@@ -51,11 +51,16 @@ export class ShopifyInventoryService {
     // lookup — it happens before we know which tenant this is.
     const store = await this.prisma.runAsSystem(() =>
       this.prisma.storeConnection.findUnique({
-        where: { shopDomain },
+        where: {
+          platform_externalStoreId: {
+            platform: StorePlatform.SHOPIFY,
+            externalStoreId: shopDomain,
+          },
+        },
         select: {
           id: true,
           tenantId: true,
-          shopDomain: true,
+          externalStoreId: true,
           platform: true,
           encryptedAccessToken: true,
         },
@@ -80,7 +85,7 @@ export class ShopifyInventoryService {
   private async syncResolvedStoreInventory(store: {
     id: string;
     tenantId: string;
-    shopDomain: string;
+    externalStoreId: string;
     encryptedAccessToken: string | null;
   }) {
     const encryptionKey = this.config.get<string>("ENCRYPTION_KEY");
@@ -101,7 +106,7 @@ export class ShopifyInventoryService {
 
     do {
       const page = await this.fetchProductsPage(
-        store.shopDomain,
+        store.externalStoreId,
         accessToken,
         cursor,
       );
@@ -144,7 +149,7 @@ export class ShopifyInventoryService {
     } while (cursor);
 
     return {
-      shopDomain: store.shopDomain,
+      shopDomain: store.externalStoreId,
       pages,
       products: productsRead,
       inventoryLevelsSynced,

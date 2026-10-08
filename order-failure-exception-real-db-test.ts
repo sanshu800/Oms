@@ -2,6 +2,7 @@
 import { AppModule } from "./src/app.module";
 import { PrismaService } from "./src/prisma/prisma.service";
 import { OrderService } from "./src/oms/order/order.service";
+import { ShopifyConnector } from "./src/connectors/shopify/shopify.connector";
 
 async function main() {
   const app = await NestFactory.createApplicationContext(AppModule);
@@ -12,12 +13,15 @@ async function main() {
 
     const store = await prisma.storeConnection.findUnique({
       where: {
-        shopDomain: "techmart-lab.myshopify.com",
+        platform_externalStoreId: {
+          platform: "SHOPIFY",
+          externalStoreId: "techmart-lab.myshopify.com",
+        },
       },
       select: {
         id: true,
         tenantId: true,
-        shopDomain: true,
+        externalStoreId: true,
       },
     });
 
@@ -55,7 +59,7 @@ async function main() {
     const orderNumber = `#REAL-FAIL-${Date.now()}`;
 
     console.log(JSON.stringify({
-      store: store.shopDomain,
+      store: store.externalStoreId,
       tenantId: store.tenantId,
       storeId: store.id,
       sku: inventoryItem.sku,
@@ -68,10 +72,13 @@ async function main() {
     let orderId: string | null = null;
 
     try {
-      await orderService.upsertFromShopify({
+      const connector = new ShopifyConnector(prisma as never, {} as never);
+      await orderService.upsertFromChannel({
         tenantId: store.tenantId,
         storeId: store.id,
-        payload: {
+        order: connector.normalizeOrder({
+          topic: "orders/create",
+          payload: {
           id: externalOrderId,
           name: orderNumber,
           financial_status: "paid",
@@ -88,7 +95,8 @@ async function main() {
               price: "629.95",
             },
           ],
-        },
+          },
+        }),
       });
 
       throw new Error(

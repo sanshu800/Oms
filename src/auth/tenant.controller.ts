@@ -28,7 +28,7 @@ export class TenantController {
         select: {
           id: true,
           platform: true,
-          shopDomain: true,
+          externalStoreId: true,
           status: true,
           scopes: true,
           installedAt: true,

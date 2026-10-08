@@ -210,8 +210,14 @@ model StoreConnection {
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
   platform        StorePlatform
-  externalStoreId String?
-  shopDomain      String        @unique
+
+  /// Neutral external store identity (locked decision 5): the id the
+  /// channel itself uses for this store — for Shopify, the shop domain
+  /// (`techmart-lab.myshopify.com`), which is what its webhook deliveries
+  /// and OAuth flows name. Inbound deliveries resolve to a StoreConnection
+  /// through (platform, externalStoreId); nothing else may be used as the
+  /// store identity at the boundary.
+  externalStoreId String
 
   status StoreConnectionStatus @default(PENDING)
 
@@ -244,6 +250,7 @@ model StoreConnection {
   fulfillments Fulfillment[]
   shipments    Shipment[]
 
+  @@unique([platform, externalStoreId])
   @@index([tenantId, status])
 }
 
@@ -259,7 +266,10 @@ model WebhookEvent {
 
   topic String
 
-  shopifyEventId String
+  /// The channel's id for this delivery (locked decision 6). Idempotency
+  /// key: a duplicate delivery of the same event is acknowledged without
+  /// re-queueing.
+  externalEventId String
 
   payload       Json
   payloadSha256 String
@@ -273,7 +283,7 @@ model WebhookEvent {
 
   lastError String?
 
-  @@unique([storeId, shopifyEventId])
+  @@unique([storeId, externalEventId])
   @@index([tenantId, storeId, status, receivedAt])
 }
 
@@ -359,6 +369,15 @@ model OrderItem {
    * External line-item identity from the originating platform.
    */
   externalLineItemId String
+
+  /**
+   * The channel's catalog-item reference for this line (e.g. the channel
+   * variant/inventory-item id), when the payload carries one. Primary key
+   * for canonical inventory resolution via
+   * InventoryItemExternalReference (see
+   * src/oms/inventory/canonical-mapping.ts for the full rule).
+   */
+  externalItemRef String?
 
   /**
    * Keep the original SKU observed from the channel

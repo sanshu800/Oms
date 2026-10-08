@@ -230,7 +230,12 @@ async function main() {
   }
 
   const existing = await prisma.storeConnection.findUnique({
-    where: { shopDomain: shop },
+    where: {
+      platform_externalStoreId: {
+        platform: "SHOPIFY",
+        externalStoreId: shop,
+      },
+    },
     select: { id: true, tenantId: true, status: true },
   });
 
@@ -308,11 +313,16 @@ async function main() {
     }
 
     const store = await tx.storeConnection.upsert({
-      where: { shopDomain: shop },
+      where: {
+        platform_externalStoreId: {
+          platform: "SHOPIFY",
+          externalStoreId: shop,
+        },
+      },
       create: {
         tenantId: resolvedTenantId,
         platform: "SHOPIFY",
-        shopDomain: shop,
+        externalStoreId: shop,
         status: "ACTIVE",
         encryptedAccessToken,
         encryptedWebhookSecret,
@@ -331,7 +341,7 @@ async function main() {
         installedAt: new Date(),
         disconnectedAt: null,
       },
-      select: { id: true, shopDomain: true, status: true, tenantId: true },
+      select: { id: true, externalStoreId: true, status: true, tenantId: true },
     });
 
     return { store, tenantId: resolvedTenantId };
@@ -353,7 +363,7 @@ async function main() {
     JSON.stringify(
       {
         connected: true,
-        shopDomain: result.store.shopDomain,
+        shopDomain: result.store.externalStoreId,
         storeConnectionId: result.store.id,
         status: result.store.status,
         tenant: { id: result.tenantId, name: tenantName },

@@ -90,7 +90,7 @@ export class ShopifyAuthController {
         </head>
         <body>
           <h1>TechMart connected</h1>
-          <p>Shopify store: ${store.shopDomain}</p>
+          <p>Shopify store: ${store.externalStoreId}</p>
           <p>Status: ${store.status}</p>
           <p>Read-only connection established successfully.</p>
           ${apiKeySection}

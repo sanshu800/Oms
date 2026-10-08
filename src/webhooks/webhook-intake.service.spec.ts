@@ -4,6 +4,7 @@ vi.mock("@prisma/client", () => import("../../test-utils/prisma-client.mock"));
 
 import { ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
 
+import { ShopifyConnector } from "../connectors/shopify/shopify.connector";
 import { encryptSecret } from "../shopify/shopify-auth.crypto";
 import { signShopifyWebhookPayload } from "./shopify-signature";
 import { WebhookIntakeService } from "./webhook-intake.service";
@@ -79,28 +80,49 @@ function createService(options: {
     get: vi.fn((key: string) => configValues[key]),
   };
 
+  const connector = new ShopifyConnector(
+    prisma as never,
+    configService as never,
+  );
+
   const service = new WebhookIntakeService(
     prisma as never,
     queue as never,
     configService as never,
   );
 
-  return { service, prisma, queue };
+  const record = (input: ReturnType<typeof rawDelivery>) =>
+    service.recordDelivery({ connector, ...input });
+
+  return { service, prisma, queue, record };
 }
 
 const RAW_BODY = Buffer.from(JSON.stringify({ id: 1 }), "utf8");
 
 /** A delivery signed with whatever secret the case under test expects. */
-function rawDelivery(secret: string, overrides: Record<string, unknown> = {}) {
+function rawDelivery(
+  secret: string,
+  overrides: { signature?: string | undefined } = {},
+) {
+  const signature = "signature" in overrides
+    ? overrides.signature
+    : signShopifyWebhookPayload(RAW_BODY, secret);
+
   return {
-    shopDomain: "techmart-lab.myshopify.com",
-    webhookId: "wh-1",
-    topic: "orders/create",
+    envelope: {
+      storeKey: "techmart-lab.myshopify.com",
+      externalEventId: "wh-1",
+      topic: "orders/create",
+    },
+    headers: {
+      "x-shopify-hmac-sha256": signature,
+      "x-shopify-shop-domain": "techmart-lab.myshopify.com",
+      "x-shopify-webhook-id": "wh-1",
+      "x-shopify-topic": "orders/create",
+    },
     payload: { id: 1 },
     payloadSha256: "deadbeef",
     rawBody: RAW_BODY,
-    signature: signShopifyWebhookPayload(RAW_BODY, secret),
-    ...overrides,
   };
 }
 
@@ -114,9 +136,9 @@ describe("WebhookIntakeService", () => {
   });
 
   it("stores a new delivery and marks it for queueing", async () => {
-    const { service, prisma } = createService();
+    const { record, prisma } = createService();
 
-    const recorded = await service.recordShopifyDelivery(delivery);
+    const recorded = await record(delivery);
 
     expect(recorded).toEqual({
       webhookEventId: "event-1",
@@ -128,9 +150,9 @@ describe("WebhookIntakeService", () => {
   });
 
   it("accepts a processed duplicate without queueing it again", async () => {
-    const { service, queue } = createService({ eventStatus: "PROCESSED" });
+    const { service, record, queue } = createService({ eventStatus: "PROCESSED" });
 
-    const recorded = await service.recordShopifyDelivery(delivery);
+    const recorded = await record(delivery);
 
     expect(recorded.shouldEnqueue).toBe(false);
     await service.enqueueForProcessing(recorded);
@@ -139,9 +161,9 @@ describe("WebhookIntakeService", () => {
   });
 
   it("resets a previously failed delivery and clears the stale job", async () => {
-    const { service, prisma, queue } = createService({ eventStatus: "FAILED" });
+    const { service, record, prisma, queue } = createService({ eventStatus: "FAILED" });
 
-    const recorded = await service.recordShopifyDelivery(delivery);
+    const recorded = await record(delivery);
 
     expect(recorded).toEqual({
       webhookEventId: "event-1",
@@ -161,13 +183,13 @@ describe("WebhookIntakeService", () => {
   });
 
   it("marks the event failed and answers 503 when the queue rejects", async () => {
-    const { service, prisma } = createService({
+    const { service, record, prisma } = createService({
       enqueue: async () => {
         throw new Error("Redis connection refused");
       },
     });
 
-    const recorded = await service.recordShopifyDelivery(delivery);
+    const recorded = await record(delivery);
 
     await expect(service.enqueueForProcessing(recorded)).rejects.toBeInstanceOf(
       ServiceUnavailableException,
@@ -180,12 +202,12 @@ describe("WebhookIntakeService", () => {
   });
 
   it("fails fast when queueing exceeds the deadline", async () => {
-    const { service, prisma } = createService({
+    const { service, record, prisma } = createService({
       enqueueTimeoutMs: 250,
       enqueue: () => new Promise<void>(() => undefined),
     });
 
-    const recorded = await service.recordShopifyDelivery(delivery);
+    const recorded = await record(delivery);
 
     await expect(service.enqueueForProcessing(recorded)).rejects.toBeInstanceOf(
       ServiceUnavailableException,
@@ -203,11 +225,11 @@ describe("WebhookIntakeService", () => {
    * Shopify deletes a subscription that keeps failing.
    */
   it("verifies a store-specific secret in preference to the environment secret", async () => {
-    const { service, prisma } = createService({
+    const { record, prisma } = createService({
       storeWebhookSecret: STORE_WEBHOOK_SECRET,
     });
 
-    const recorded = await service.recordShopifyDelivery(
+    const recorded = await record(
       rawDelivery(STORE_WEBHOOK_SECRET),
     );
 
@@ -216,12 +238,12 @@ describe("WebhookIntakeService", () => {
   });
 
   it("rejects a delivery signed with the environment secret when the store has its own", async () => {
-    const { service, prisma } = createService({
+    const { record, prisma } = createService({
       storeWebhookSecret: STORE_WEBHOOK_SECRET,
     });
 
     await expect(
-      service.recordShopifyDelivery(rawDelivery(ENV_WEBHOOK_SECRET)),
+      record(rawDelivery(ENV_WEBHOOK_SECRET)),
     ).rejects.toBeInstanceOf(UnauthorizedException);
 
     // Nothing authenticated may become replayable work.
@@ -229,10 +251,10 @@ describe("WebhookIntakeService", () => {
   });
 
   it("verifies with the environment secret when the store has none (OAuth apps)", async () => {
-    const { service } = createService({ storeWebhookSecret: null });
+    const { record } = createService({ storeWebhookSecret: null });
 
     await expect(
-      service.recordShopifyDelivery(rawDelivery(ENV_WEBHOOK_SECRET)),
+      record(rawDelivery(ENV_WEBHOOK_SECRET)),
     ).resolves.toEqual({
       webhookEventId: "event-1",
       shouldEnqueue: true,
@@ -241,26 +263,27 @@ describe("WebhookIntakeService", () => {
   });
 
   it("rejects a forged or missing signature before storing anything", async () => {
-    const { service, prisma } = createService();
+    const { record, prisma } = createService();
 
     await expect(
-      service.recordShopifyDelivery({
-        ...delivery,
-        signature: signShopifyWebhookPayload(RAW_BODY, "wrong-secret"),
-      }),
+      record(
+        rawDelivery(ENV_WEBHOOK_SECRET, {
+          signature: signShopifyWebhookPayload(RAW_BODY, "wrong-secret"),
+        }),
+      ),
     ).rejects.toBeInstanceOf(UnauthorizedException);
 
     await expect(
-      service.recordShopifyDelivery({ ...delivery, signature: undefined }),
+      record(rawDelivery(ENV_WEBHOOK_SECRET, { signature: undefined })),
     ).rejects.toBeInstanceOf(UnauthorizedException);
 
     expect(prisma.webhookEvent.upsert).not.toHaveBeenCalled();
   });
 
   it("rejects an unknown shop instead of acting on it", async () => {
-    const { service, prisma } = createService({ shopFound: false });
+    const { record, prisma } = createService({ shopFound: false });
 
-    await expect(service.recordShopifyDelivery(delivery)).rejects.toBeInstanceOf(
+    await expect(record(delivery)).rejects.toBeInstanceOf(
       UnauthorizedException,
     );
 
@@ -268,12 +291,12 @@ describe("WebhookIntakeService", () => {
   });
 
   it("explains the misconfiguration when no secret exists at all", async () => {
-    const { service } = createService({
+    const { record } = createService({
       storeWebhookSecret: null,
       envWebhookSecret: null,
     });
 
-    await expect(service.recordShopifyDelivery(delivery)).rejects.toThrow(
+    await expect(record(delivery)).rejects.toThrow(
       /SHOPIFY_WEBHOOK_SECRET is not configured/,
     );
   });
