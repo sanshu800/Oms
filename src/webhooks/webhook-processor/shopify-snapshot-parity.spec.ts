@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@prisma/client", () => import("../../../test-utils/prisma-client.mock"));
 
+import { PrismaRawOrderSnapshotStore } from "../../connectors/prisma-raw-order-snapshot.store";
 import { ShopifyConnector } from "../../connectors/shopify/shopify.connector";
 import { WebhookProcessorService } from "./webhook-processor.service";
 
@@ -87,10 +88,13 @@ describe("Shopify order snapshot parity", () => {
   });
 
   async function process() {
-    // The real ShopifyConnector runs against the mocked prisma: its
-    // snapshot write lands in the same prisma.shopifyOrderSnapshot.upsert
-    // these tests assert on, byte-for-byte.
-    const connector = new ShopifyConnector(prisma as any, {} as any);
+    // The real ShopifyConnector writes through the Prisma-backed snapshot
+    // port against the mocked prisma: the write lands in the same
+    // prisma.shopifyOrderSnapshot.upsert these tests assert on, byte-for-byte.
+    const connector = new ShopifyConnector(
+      new PrismaRawOrderSnapshotStore(prisma as any),
+      {} as any,
+    );
     const service = new WebhookProcessorService(
       prisma as any,
       orderService as any,

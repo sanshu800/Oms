@@ -72,7 +72,7 @@ async function main() {
     let orderId: string | null = null;
 
     try {
-      const connector = new ShopifyConnector(prisma as never, {} as never);
+      const connector = new ShopifyConnector({} as never, {} as never);
       await orderService.upsertFromChannel({
         tenantId: store.tenantId,
         storeId: store.id,

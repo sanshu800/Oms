@@ -1,13 +1,13 @@
 import {
   BadRequestException,
+  Inject,
   Injectable,
   Logger,
   UnauthorizedException,
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
-import { Prisma, StorePlatform } from "@prisma/client";
+import { StorePlatform } from "@prisma/client";
 
-import { PrismaService } from "../../prisma/prisma.service";
 import { decryptSecret } from "../../shopify/shopify-auth.crypto";
 import { isComplianceRestTopic } from "../../shopify/webhook-registration";
 import { verifyShopifyWebhook } from "../../webhooks/shopify-signature";
@@ -22,6 +22,10 @@ import {
   RecordRawSnapshotInput,
   VerifyDeliveryInput,
 } from "../connector.interface";
+import {
+  RAW_ORDER_SNAPSHOT_STORE,
+  RawOrderSnapshotStore,
+} from "../raw-order-snapshot.port";
 
 /**
  * The Shopify implementation of the ChannelConnector boundary.
@@ -41,7 +45,8 @@ export class ShopifyConnector implements ChannelConnector {
   private readonly logger = new Logger(ShopifyConnector.name);
 
   constructor(
-    private readonly prisma: PrismaService,
+    @Inject(RAW_ORDER_SNAPSHOT_STORE)
+    private readonly snapshots: RawOrderSnapshotStore,
     private readonly config: ConfigService,
   ) {}
 
@@ -181,10 +186,10 @@ export class ShopifyConnector implements ChannelConnector {
   async recordRawSnapshot(input: RecordRawSnapshotInput): Promise<void> {
     const payload = requireShopifyObject(input.payload);
 
-    const shopifyOrderId = requireShopifyId(payload.id, "order.id");
+    const externalOrderId = requireShopifyId(payload.id, "order.id");
 
     const orderName =
-      typeof payload.name === "string" ? payload.name : shopifyOrderId;
+      typeof payload.name === "string" ? payload.name : externalOrderId;
 
     const financialStatus =
       typeof payload.financial_status === "string"
@@ -196,41 +201,28 @@ export class ShopifyConnector implements ChannelConnector {
         ? payload.fulfillment_status
         : "unfulfilled";
 
-    const createdAtShopify = requireDate(
+    const externalCreatedAt = requireDate(
       payload.created_at,
       "order.created_at",
     );
 
-    const updatedAtShopify = requireDate(
+    const externalUpdatedAt = requireDate(
       payload.updated_at,
       "order.updated_at",
     );
 
-    await this.prisma.shopifyOrderSnapshot.upsert({
-      where: {
-        storeId_shopifyOrderId: {
-          storeId: input.storeId,
-          shopifyOrderId,
-        },
-      },
-      create: {
-        tenantId: input.tenantId,
-        storeId: input.storeId,
-        shopifyOrderId,
-        orderName,
-        financialStatus,
-        fulfillmentStatus,
-        raw: payload as Prisma.InputJsonValue,
-        createdAtShopify,
-        updatedAtShopify,
-      },
-      update: {
-        orderName,
-        financialStatus,
-        fulfillmentStatus,
-        raw: payload as Prisma.InputJsonValue,
-        updatedAtShopify,
-      },
+    // Persistence is infrastructure: the connector produces the record and
+    // hands it to the neutral snapshot port (see raw-order-snapshot.port.ts).
+    await this.snapshots.upsert({
+      tenantId: input.tenantId,
+      storeId: input.storeId,
+      externalOrderId,
+      orderName,
+      financialStatus,
+      fulfillmentStatus,
+      rawPayload: payload,
+      externalCreatedAt,
+      externalUpdatedAt,
     });
   }
 }

@@ -4,6 +4,7 @@ vi.mock("@prisma/client", () => import("../../test-utils/prisma-client.mock"));
 
 import { ServiceUnavailableException, UnauthorizedException } from "@nestjs/common";
 
+import { PrismaRawOrderSnapshotStore } from "../connectors/prisma-raw-order-snapshot.store";
 import { ShopifyConnector } from "../connectors/shopify/shopify.connector";
 import { encryptSecret } from "../shopify/shopify-auth.crypto";
 import { signShopifyWebhookPayload } from "./shopify-signature";
@@ -81,7 +82,7 @@ function createService(options: {
   };
 
   const connector = new ShopifyConnector(
-    prisma as never,
+    new PrismaRawOrderSnapshotStore(prisma as never),
     configService as never,
   );
 

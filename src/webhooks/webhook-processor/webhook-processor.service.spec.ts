@@ -4,6 +4,7 @@ import { WebhookStatus } from "@prisma/client";
 
 vi.mock("@prisma/client", () => import("../../../test-utils/prisma-client.mock"));
 
+import { PrismaRawOrderSnapshotStore } from "../../connectors/prisma-raw-order-snapshot.store";
 import { ShopifyConnector } from "../../connectors/shopify/shopify.connector";
 import { WebhookProcessorService } from "./webhook-processor.service";
 import { COMPLIANCE_REST_TOPICS } from "../../shopify/webhook-registration";
@@ -75,7 +76,12 @@ describe("WebhookProcessorService", () => {
       auditService as any,
       exceptionService as any,
       resolutionService as any,
-      [new ShopifyConnector(prisma as any, {} as any)],
+      [
+        new ShopifyConnector(
+          new PrismaRawOrderSnapshotStore(prisma as any),
+          {} as any,
+        ),
+      ],
     );
 
     prisma.webhookEvent.updateMany.mockResolvedValue({
