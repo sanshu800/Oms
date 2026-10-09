@@ -2,6 +2,7 @@ import { Module } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { BullModule } from "@nestjs/bullmq";
 
+import { AuthModule } from "../auth/auth.module";
 import { AuditModule } from "../oms/audit/audit.module";
 import { FulfillmentModule } from "../oms/fulfillment/fulfillment.module";
 import { PrismaModule } from "../prisma/prisma.module";
@@ -32,6 +33,7 @@ import { WmsRequestService } from "./wms-request.service";
 @Module({
   imports: [
     PrismaModule,
+    AuthModule,
     FulfillmentModule,
     AuditModule,
     BullModule.registerQueue({
