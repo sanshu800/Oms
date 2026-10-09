@@ -8,6 +8,7 @@ import { OrderModule } from "../oms/order/order.module";
 import { AuditModule } from "../oms/audit/audit.module";
 import { ExceptionModule } from "../oms/exception/exception.module";
 import { ResolutionModule } from "../oms/resolution/resolution.module";
+import { WmsModule } from "../wms/wms.module";
 
 import {
   WEBHOOK_QUEUE,
@@ -26,6 +27,8 @@ import { parseRedisConnectionOptions } from "../config/redis-connection";
     AuditModule,
     ExceptionModule,
     ResolutionModule,
+    // The shared integration worker also processes WMS event jobs.
+    WmsModule,
 
     BullModule.forRootAsync({
       inject: [ConfigService],

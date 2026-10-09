@@ -179,4 +179,17 @@ export const ShipmentStatus = {
   DELIVERED: "DELIVERED",
   CANCELLED: "CANCELLED",
 } as const;
+
+export const WmsProvider = {
+  FAKE: "FAKE",
+} as const;
+
+export const WmsRequestStatus = {
+  PENDING: "PENDING",
+  SUBMITTED: "SUBMITTED",
+  ACKNOWLEDGED: "ACKNOWLEDGED",
+  COMPLETED: "COMPLETED",
+  FAILED: "FAILED",
+  CANCELLED: "CANCELLED",
+} as const;
 // </generated-enums>

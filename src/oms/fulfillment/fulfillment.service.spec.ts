@@ -451,4 +451,81 @@ describe('FulfillmentService', () => {
       );
     });
   });
+
+  describe('fail', () => {
+    it('releases reservations and marks the fulfillment FAILED', async () => {
+      prisma.fulfillment.findFirst.mockResolvedValue({
+        id: 'fulfillment-1',
+        tenantId: context.tenantId,
+        storeId: context.storeId,
+        orderId: 'order-1',
+        status: FulfillmentStatus.IN_PROGRESS,
+        items: [],
+        shipments: [],
+      });
+
+      prisma.fulfillment.update.mockResolvedValue({
+        id: 'fulfillment-1',
+        status: FulfillmentStatus.FAILED,
+        items: [],
+        shipments: [],
+      });
+
+      const result = await service.fail({
+        ...context,
+        fulfillmentId: 'fulfillment-1',
+      });
+
+      expect(inventoryService.releaseOrder).toHaveBeenCalledWith({
+        tenantId: context.tenantId,
+        storeId: context.storeId,
+        orderId: 'order-1',
+      });
+
+      expect(result.status).toBe(FulfillmentStatus.FAILED);
+    });
+
+    it('is idempotent on an already-failed fulfillment', async () => {
+      prisma.fulfillment.findFirst.mockResolvedValue({
+        id: 'fulfillment-1',
+        tenantId: context.tenantId,
+        storeId: context.storeId,
+        orderId: 'order-1',
+        status: FulfillmentStatus.FAILED,
+        items: [],
+        shipments: [],
+      });
+
+      const result = await service.fail({
+        ...context,
+        fulfillmentId: 'fulfillment-1',
+      });
+
+      expect(result.status).toBe(FulfillmentStatus.FAILED);
+      expect(prisma.fulfillment.update).not.toHaveBeenCalled();
+    });
+
+    it('refuses to fail a fulfillment that already shipped something', async () => {
+      prisma.fulfillment.findFirst.mockResolvedValue({
+        id: 'fulfillment-1',
+        tenantId: context.tenantId,
+        storeId: context.storeId,
+        orderId: 'order-1',
+        status: FulfillmentStatus.PARTIALLY_FULFILLED,
+        items: [],
+        shipments: [],
+      });
+
+      await expect(
+        service.fail({
+          ...context,
+          fulfillmentId: 'fulfillment-1',
+        }),
+      ).rejects.toThrow(
+        'Cannot fail fulfillment from status PARTIALLY_FULFILLED',
+      );
+
+      expect(inventoryService.releaseOrder).not.toHaveBeenCalled();
+    });
+  });
 });

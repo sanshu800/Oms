@@ -9,10 +9,14 @@ describe("WebhookWorker", () => {
     processEvent: vi.fn(),
   };
 
+  const wmsEventProcessor = {
+    processEvent: vi.fn(),
+  };
+
   beforeEach(() => {
     vi.clearAllMocks();
 
-    worker = new WebhookWorker(webhookProcessor as any);
+    worker = new WebhookWorker(webhookProcessor as any, wmsEventProcessor as any);
   });
 
   it("should pass the BullMQ attempt number to the processor", async () => {

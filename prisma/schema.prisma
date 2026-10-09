@@ -167,6 +167,10 @@ model Tenant {
   fulfillments Fulfillment[]
   shipments    Shipment[]
 
+  wmsConnections         WmsConnection[]
+  wmsFulfillmentRequests WmsFulfillmentRequest[]
+  wmsEvents              WmsEvent[]
+
   aiInvestigations    AiInvestigation[]
   aiDecisionProposals AiDecisionProposal[]
   aiMemoryFacts       AiMemoryFact[]
@@ -249,6 +253,8 @@ model StoreConnection {
 
   fulfillments Fulfillment[]
   shipments    Shipment[]
+
+  wmsFulfillmentRequests WmsFulfillmentRequest[]
 
   @@unique([platform, externalStoreId])
   @@index([tenantId, status])
@@ -398,6 +404,8 @@ model OrderItem {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  wmsRequestLines WmsFulfillmentRequestLine[]
+
   @@unique([orderId, externalLineItemId])
   @@index([inventoryItemId])
 }
@@ -509,6 +517,8 @@ model InventoryLocation {
   movements InventoryMovement[]
 
   externalReferences InventoryLocationExternalReference[]
+
+  wmsConnections WmsConnection[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -720,6 +730,8 @@ model Fulfillment {
   items FulfillmentItem[]
 
   shipments Shipment[]
+
+  wmsRequests WmsFulfillmentRequest[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -1248,4 +1260,208 @@ model AiAutonomyPolicy {
   updatedAt DateTime @updatedAt
 
   @@unique([tenantId, actionType])
+}
+
+//
+// ============================================================
+// WMS INTEGRATION FOUNDATION (Stage 1)
+// ============================================================
+//
+// Provider-neutral boundary between TechMart OMS and merchant
+// warehouse management systems. Stage 1 ships the contract, the
+// durable/idempotent pipeline, and one deterministic FAKE adapter
+// for end-to-end testing. No real WMS product is integrated and no
+// provider capabilities are implied beyond the fake adapter's.
+//
+// Warehouse execution (Fulfillment / pick / pack / handover) stays
+// deliberately separate from shipping-provider operations (Shipment
+// label / AWB / tracking): see wms-status-mapping.ts.
+//
+
+enum WmsProvider {
+  /// Deterministic in-repo fake — the only registered adapter in Stage 1.
+  FAKE
+}
+
+enum WmsRequestStatus {
+  /// Row created as the idempotency anchor; adapter call not confirmed yet.
+  PENDING
+  /// Accepted by the WMS adapter (externalRequestId assigned).
+  SUBMITTED
+  /// Warehouse confirmed it will execute (ack event applied).
+  ACKNOWLEDGED
+  /// Every requested quantity has shipped.
+  COMPLETED
+  /// Submit failed or the warehouse reported failure.
+  FAILED
+  CANCELLED
+}
+
+model WmsConnection {
+  id String @id @default(uuid()) @db.Uuid
+
+  tenantId String @db.Uuid
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  provider WmsProvider
+
+  /// The warehouse identity used by the WMS provider (analogous to
+  /// StoreConnection.externalStoreId). Inbound deliveries resolve to a
+  /// connection through (provider, externalWarehouseId) plus the
+  /// per-connection secret check; nothing else identifies a warehouse.
+  externalWarehouseId String
+
+  /// The canonical inventory location this warehouse fulfills from.
+  locationId String @db.Uuid
+
+  location InventoryLocation @relation(fields: [locationId], references: [id], onDelete: Restrict)
+
+  status StoreConnectionStatus @default(PENDING)
+
+  /// Outbound API credential, encrypted at rest (ENCRYPTION_KEY).
+  /// Never logged, never returned by any API.
+  encryptedApiKey String?
+
+  /// Inbound event signing secret, encrypted at rest (ENCRYPTION_KEY).
+  encryptedWebhookSecret String?
+
+  connectedAt    DateTime?
+  disconnectedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  requests WmsFulfillmentRequest[]
+  events   WmsEvent[]
+
+  @@unique([tenantId, provider, externalWarehouseId])
+  @@index([tenantId, status])
+}
+
+model WmsFulfillmentRequest {
+  id String @id @default(uuid()) @db.Uuid
+
+  tenantId       String @db.Uuid
+  storeId        String @db.Uuid
+  connectionId   String @db.Uuid
+  fulfillmentId  String @db.Uuid
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  store StoreConnection @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  connection WmsConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  fulfillment Fulfillment @relation(fields: [fulfillmentId], references: [id], onDelete: Cascade)
+
+  /// The WMS provider's identity for this request (assigned at submit).
+  externalRequestId String?
+
+  /// Deterministic idempotency key (the fulfillment id). Resubmits and
+  /// worker retries reuse it, so a provider can never be asked twice for
+  /// the same fulfillment, however many times we call.
+  idempotencyKey String
+
+  status WmsRequestStatus @default(PENDING)
+
+  lastError String?
+
+  submittedAt    DateTime?
+  acknowledgedAt DateTime?
+  completedAt    DateTime?
+  failedAt       DateTime?
+  cancelledAt    DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  lines  WmsFulfillmentRequestLine[]
+  events WmsEvent[]
+
+  @@unique([connectionId, idempotencyKey])
+  @@unique([connectionId, externalRequestId])
+  @@index([tenantId, storeId, status])
+  @@index([fulfillmentId])
+}
+
+model WmsFulfillmentRequestLine {
+  id String @id @default(uuid()) @db.Uuid
+
+  requestId String @db.Uuid
+
+  request WmsFulfillmentRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  orderItemId String @db.Uuid
+
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Restrict)
+
+  /// Stable per-line reference echoed back by WMS events
+  /// (`externalLineRef`) — Stage 1 sets it to the OrderItem id.
+  externalLineRef String
+
+  sku String
+
+  quantity Int
+
+  /// Warehouse execution progress. Cumulative and monotonically
+  /// non-decreasing. Picked/packed quantities are execution facts only:
+  /// they never imply a label, an AWB, or carrier handover (those are
+  /// Shipment facts, owned by shipping-provider integrations).
+  pickedQuantity Int @default(0)
+  packedQuantity Int @default(0)
+
+  /// Derived from the sum of live shipment items — SET from that sum,
+  /// never incremented from raw events, so replays cannot double-count.
+  shippedQuantity Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([requestId, orderItemId])
+  @@unique([requestId, externalLineRef])
+  @@index([orderItemId])
+}
+
+model WmsEvent {
+  id String @id @default(uuid()) @db.Uuid
+
+  tenantId     String @db.Uuid
+  connectionId String @db.Uuid
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  connection WmsConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  requestId String? @db.Uuid
+
+  request WmsFulfillmentRequest? @relation(fields: [requestId], references: [id], onDelete: SetNull)
+
+  /// The provider's id for this event. Durable idempotency key: a
+  /// duplicate delivery is acknowledged without being re-applied.
+  externalEventId String
+
+  /// Canonical wire event type (see wms-status-mapping.ts). Unknown
+  /// types are durably recorded and rejected — never applied.
+  eventType String
+
+  payload       Json
+  payloadSha256 String
+
+  status WebhookStatus @default(RECEIVED)
+
+  attempts Int @default(0)
+
+  receivedAt  DateTime  @default(now())
+  processedAt DateTime?
+
+  lastError String?
+
+  /// Set when the event was durably recorded but deliberately NOT applied
+  /// (unknown event type, invalid transition, stale/invalid quantities,
+  /// foreign request reference, ...). Rejections never mutate domain state.
+  rejectionReason String?
+
+  @@unique([connectionId, externalEventId])
+  @@index([tenantId, connectionId, status, receivedAt])
 }
