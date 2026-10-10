@@ -13,7 +13,12 @@ ALTER INDEX "WebhookEvent_storeId_shopifyEventId_key" RENAME TO "WebhookEvent_st
 --    which is what webhook deliveries and OAuth flows name.
 ALTER TABLE "StoreConnection" DROP COLUMN "externalStoreId";
 ALTER TABLE "StoreConnection" RENAME COLUMN "shopDomain" TO "externalStoreId";
-ALTER TABLE "StoreConnection" DROP CONSTRAINT "StoreConnection_shopDomain_key";
+-- Prisma creates column uniques as UNIQUE INDEXes (see 0_init:
+-- CREATE UNIQUE INDEX "StoreConnection_shopDomain_key"), not table
+-- constraints. Accept BOTH shapes so the chain is reproducible
+-- from scratch and on db-push dev databases.
+DROP INDEX IF EXISTS "StoreConnection_shopDomain_key";
+ALTER TABLE "StoreConnection" DROP CONSTRAINT IF EXISTS "StoreConnection_shopDomain_key";
 ALTER TABLE "StoreConnection" ADD CONSTRAINT "StoreConnection_platform_externalStoreId_key" UNIQUE ("platform", "externalStoreId");
 
 -- 3. OrderItem (decision 4): carries the channel catalog-item reference

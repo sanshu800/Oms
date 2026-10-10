@@ -20,6 +20,24 @@ Hard rules (contract-pinned tests):
 
 `mapShippingEventToCanonicalAction` is the only sanctioned reducer: `record_shipment_created`, `record_label_created` (→ `labelShipment()`, stops at `LABEL_CREATED`), `record_handover_confirmed` (→ `shipShipment()`), `record_delivered` (→ `deliverShipment()`), `record_cancellation_requested` (bookkeeping only), `record_cancellation_confirmed` (→ `cancelShipment()`), `record_progress` (no domain mutation), `reject_event` (reason + audit, no mutation — mirrors WMS convention).
 
+## 2a. Cancellation semantics (Stage 2.1, tested)
+
+A confirmed cancellation always applies to **one shipment** (`cancelShipment`) — sibling shipments and their items/history are never touched. What happens next depends on the fulfillment's state:
+
+| State of the fulfillment | Fulfillment cancelled? | Inventory released? | Reconciliation |
+|---|---|---|---|
+| **Partially shipped** (a sibling is `IN_TRANSIT`/`DELIVERED`, or status `PARTIALLY_FULFILLED`/`FULFILLED`) | **No** | **No — never** | Flagged |
+| **Sibling shipments live, nothing shipped** | No | **No** (would free the siblings' reservations) | Audit only (`SHIPPING_SHIPMENT_CANCELLED`) |
+| **Cancelled shipment is the last live one, nothing shipped** | Yes (`READY`/`IN_PROGRESS`) | Yes — `releaseOrder` is **correct** here | — |
+
+Why the partial case never releases: `InventoryReservation` rows are **per order item** (they cover shipped and unshipped units alike), and `InventoryService.releaseOrder` frees whole `ACTIVE` reservations. Releasing after a partial shipment would return already-shipped units to stock — an over-release. The remainder reservation therefore stays `ACTIVE` pending operator reconciliation (`needsReconciliation` + reason on the cancelled shipment); a partial-release capability in `InventoryService` would be a separate, deliberate domain change.
+
+A cancellation REQUEST (`cancellationRequestedAt`) is soft bookkeeping and never changes any status. If handover/delivery wins the race (committed first), the verified provider state is preserved and reconciliation is flagged; if cancellation wins, later handover/delivery events are quarantined (with the same flag).
+
+## 2b. Inventory transaction ordering (Stage 2.1)
+
+Reservations move `ACTIVE → COMMITTED` (`commitOrder`, via `FulfillmentService.complete()` when every unit is allocated to live shipments) and `COMMITTED → SHIPPED` (`shipOrder`, via `shipShipment()`). Integrations must therefore **`complete()` before `shipShipment()`** — the same sequence the canonical order flow uses (`FULFILLING → FULFILLED` transitions). The reverse order makes `shipOrder` a silent no-op (it only moves `COMMITTED` rows) and strands reservations at `COMMITTED`. Both the WMS and shipping processors do this in that order; the real-DB scripts assert the `SHIPPED` reservation state.
+
 ## 3. Shiprocket API research (public docs, Oct 2026)
 
 Sources: [apidocs.shiprocket.in](https://apidocs.shiprocket.in/), [apidocs-test.shiprocket.in](https://apidocs-test.shiprocket.in/), [Shiprocket support help sheet](https://support.shiprocket.in/support/solutions/articles/43000337456-shiprocket-api-document-helpsheet).
@@ -61,7 +79,33 @@ Sources: [apidocs.shiprocket.in](https://apidocs.shiprocket.in/), [apidocs-test.
 3. **RTO handling:** treat `RTO_*` as its own order outcome (`RETURNED`?) or reuse `DELIVERY_FAILED` + exception workflows?
 4. **Who initiates cancellation** in v1: OMS UI/API first, or provider-panel-initiated only?
 5. **Multi-shipment orders:** Shiprocket creates one provider order per fulfillment; if we ever split one fulfillment across couriers, `Shipment.externalShipmentId` stays unique per provider shipment — confirm no business need for courier fallback after AWB assignment (re-assign flow exists in Shiprocket).
+6. **Partial-release inventory capability:** after a remainder cancellation on a partially shipped fulfillment, the remainder reservation stays `ACTIVE` (see §2a). A partial-release API in `InventoryService` (release only the unshipped units) would close the loop — needs an owner decision.
 
-## 8. Smallest safe next implementation step
+## 8. Running the real-database acceptance tests
+
+The real-DB scripts (`wms-foundation-real-db-test.ts`, `shipping-foundation-real-db-test.ts`) verify migrations, RLS tenant isolation, duplicate-event constraints, foreign-tenant invisibility, and inventory transaction behavior against real PostgreSQL.
+
+**Topology matters:** Postgres exempts superusers from RLS unconditionally. Run migrations as the table-owning role, then run the scripts as that same **non-superuser** role (or any restricted role):
+
+```bash
+# 1. Start PostgreSQL 17 (or 16) and create a NON-superuser app role:
+docker compose up -d db                       # or any local PostgreSQL
+psql "$ADMIN_URL" -c "CREATE ROLE oms LOGIN PASSWORD 'oms' CREATEDB;"
+psql "$ADMIN_URL" -c "CREATE DATABASE oms OWNER oms;"
+
+# 2. Apply all migrations as the table-owning role:
+export DATABASE_URL="postgresql://oms:oms@127.0.0.1:5432/oms"
+npx prisma migrate deploy                     # or apply each prisma/migrations/*/migration.sql in order
+
+# 3. Run the acceptance scripts (same DATABASE_URL, non-superuser):
+export REDIS_URL="redis://localhost:6379" JWT_SECRET="<32+ chars>" \
+       ENCRYPTION_KEY="<32+ chars>" APP_URL="http://localhost:4000"
+npx ts-node wms-foundation-real-db-test.ts
+npx ts-node shipping-foundation-real-db-test.ts
+```
+
+Both scripts print a JSON block with `"result": "PASS"` and per-assertion evidence (reservation states, movement types, RLS checks). Anything else is a failure — never report the gate as passed on a non-PASS run.
+
+## 9. Smallest safe next implementation step
 
 Stage 2's first commit: `ShippingConnection` + `ShippingEvent` migration and models (purely additive) plus the `shipping-event` queue dispatch in the existing webhook worker — no behavior change to any current flow. Then intake/processor with the FAKE shipping adapter behind the same deterministic-test pattern as WMS Stage 1.

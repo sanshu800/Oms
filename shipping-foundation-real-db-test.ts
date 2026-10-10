@@ -14,6 +14,18 @@
  * cancellation requested/confirmed distinctness and race handling →
  * RLS tenant isolation on the new tables → audit trail.
  *
+ * Also verifies (Stage 2.1 database gate): cancellation on a PARTIALLY
+ * SHIPPED fulfillment preserves shipped history and never releases
+ * inventory; the duplicate-event / idempotency unique constraints
+ * (P2002); and foreign-tenant invisibility under real RLS.
+ *
+ * Run topology matters: run migrations as the table-owning role, then run
+ * this script as a NON-superuser role (Postgres exempts superusers from
+ * RLS unconditionally). See docs/SHIPPING-PROVIDER.md §8 for commands.
+ * The whole flow runs under a system-bypass context (provisioning); the
+ * services themselves establish their own tenant contexts internally, so
+ * every processor/intake query still exercises real RLS.
+ *
  * Run: npx ts-node shipping-foundation-real-db-test.ts
  */
 import { NestFactory } from "@nestjs/core";
@@ -26,6 +38,7 @@ import {
 
 import { AppModule } from "./src/app.module";
 import { PrismaService } from "./src/prisma/prisma.service";
+import { tenantContextStorage } from "./src/prisma/tenant-context";
 import { FulfillmentService } from "./src/oms/fulfillment/fulfillment.service";
 import { encryptSecret } from "./src/shopify/shopify-auth.crypto";
 import { FakeShippingProviderAdapter } from "./src/shipping/fake/fake-shipping.adapter";
@@ -387,6 +400,215 @@ async function main() {
 
     assert(afterConfirm.status === ShipmentStatus.CANCELLED, "confirmed cancellation not applied");
 
+    // Sole shipment, nothing shipped: releaseOrder is CORRECT here — the
+    // order's reservations must end RELEASED.
+    const order2Reservations = await prisma.inventoryReservation.findMany({
+      where: { orderId: order2.id },
+    });
+
+    assert(order2Reservations.length > 0, "order2 has no reservations");
+    assert(
+      order2Reservations.every((r) => r.status === "RELEASED"),
+      `order2 reservations are ${order2Reservations.map((r) => r.status).join(",")} — expected RELEASED`,
+    );
+
+    // ---- (5b) Partially shipped fulfillment: remainder cancellation ----
+    //
+    // A WMS-style shipment (2 of 3 units) hands over first; then the
+    // shipping-provider remainder (1 unit) is cancelled. The completed
+    // shipment history must survive, and NO inventory may be released
+    // (releaseOrder frees whole ACTIVE reservations — shipped units
+    // included — which would be an over-release).
+
+    const order3 = await prisma.order.create({
+      data: {
+        tenantId: tenant.id,
+        storeId: store.id,
+        externalOrderId: `shipping-real-db-order3-${stamp}`,
+        orderNumber: `#S3-${stamp}`,
+        status: "NEW",
+        paymentStatus: "paid",
+        fulfillmentStatus: "unfulfilled",
+        totalAmount: "30.00",
+        currency: "USD",
+        orderedAt: new Date(),
+        items: {
+          create: {
+            externalLineItemId: `shipping-real-db-line3-${stamp}`,
+            sku: inventoryItem.sku,
+            title: "Shipping Stage-2 Item",
+            quantity: 3,
+            unitPrice: "10.00",
+          },
+        },
+      },
+      include: { items: true },
+    });
+
+    await prisma.inventoryReservation.createMany({
+      data: {
+        tenantId: tenant.id,
+        storeId: store.id,
+        orderId: order3.id,
+        orderItemId: order3.items[0]!.id,
+        inventoryItemId: inventoryItem.id,
+        locationId: location.id,
+        quantity: 3,
+        status: "ACTIVE",
+      },
+    });
+
+    const fulfillment3 = (
+      await fulfillmentService.createForOrder({
+        tenantId: tenant.id,
+        storeId: store.id,
+        orderId: order3.id,
+      })
+    )[0]!;
+
+    await fulfillmentService.start({
+      tenantId: tenant.id,
+      storeId: store.id,
+      fulfillmentId: fulfillment3.id,
+    });
+
+    const fulfillment3View = await fulfillmentService.getById({
+      tenantId: tenant.id,
+      storeId: store.id,
+      fulfillmentId: fulfillment3.id,
+    });
+    const fi3 = fulfillment3View.items[0]!;
+
+    const shipmentA = await fulfillmentService.createShipment({
+      tenantId: tenant.id,
+      storeId: store.id,
+      fulfillmentId: fulfillment3.id,
+      externalShipmentId: `ext3-A-${stamp}`,
+      items: [{ fulfillmentItemId: fi3.id, quantity: 2 }],
+    });
+
+    await deliver({
+      type: ShippingWireEventType.TRACKING_UPDATED,
+      externalEventId: `se3-A-handover-${stamp}`,
+      externalShipmentId: `ext3-A-${stamp}`,
+      status: "in_transit",
+    });
+
+    const afterHandover3 = await prisma.fulfillment.findUniqueOrThrow({
+      where: { id: fulfillment3.id },
+    });
+
+    assert(
+      afterHandover3.status === "PARTIALLY_FULFILLED",
+      `after partial handover: fulfillment is ${afterHandover3.status}`,
+    );
+
+    const shipmentB = await fulfillmentService.createShipment({
+      tenantId: tenant.id,
+      storeId: store.id,
+      fulfillmentId: fulfillment3.id,
+      externalShipmentId: `ext3-B-${stamp}`,
+      items: [{ fulfillmentItemId: fi3.id, quantity: 1 }],
+    });
+
+    await deliver({
+      type: ShippingWireEventType.CANCELLATION_CONFIRMED,
+      externalEventId: `se3-B-cancelled-${stamp}`,
+      externalShipmentId: `ext3-B-${stamp}`,
+      status: "cancelled",
+    });
+
+    const finalA = await prisma.shipment.findUniqueOrThrow({
+      where: { id: shipmentA.id },
+      include: { items: true },
+    });
+    const finalB = await prisma.shipment.findUniqueOrThrow({
+      where: { id: shipmentB.id },
+      include: { items: true },
+    });
+    const finalFulfillment3 = await prisma.fulfillment.findUniqueOrThrow({
+      where: { id: fulfillment3.id },
+    });
+
+    // History preserved: only the remainder is cancelled.
+    assert(finalB.status === ShipmentStatus.CANCELLED, `remainder is ${finalB.status}`);
+    assert(finalA.status === ShipmentStatus.IN_TRANSIT, `shipped sibling is ${finalA.status} — history not preserved`);
+    assert(finalA.items.length === 1, "shipped sibling items were mutated");
+    assert(
+      finalFulfillment3.status === "PARTIALLY_FULFILLED",
+      `partially shipped fulfillment became ${finalFulfillment3.status}`,
+    );
+
+    // No incorrect inventory release: the order's reservations cover shipped
+    // and unshipped units alike — none may be RELEASED or COMMITTED here.
+    const order3Reservations = await prisma.inventoryReservation.findMany({
+      where: { orderId: order3.id },
+    });
+
+    assert(order3Reservations.length > 0, "no reservations recorded for order3");
+    assert(
+      order3Reservations.reduce((sum, r) => sum + r.quantity, 0) === 3,
+      "expected 3 reserved units for order3",
+    );
+    assert(
+      order3Reservations.every((r) => r.status === "ACTIVE"),
+      `order3 reservations are ${order3Reservations.map((r) => r.status).join(",")} — expected all ACTIVE (no release after partial shipment)`,
+    );
+
+    assert(finalB.needsReconciliation === true, "partial cancellation not flagged for reconciliation");
+
+    // Shipped bookkeeping still counts only the live shipment.
+    const sums3 = await fulfillmentService.getShippedQuantityByFulfillmentItem(
+      fulfillment3.id,
+    );
+
+    assert(sums3.get(fi3.id) === 2, `shipped sum is ${sums3.get(fi3.id)} — expected 2`);
+
+    // ---- (5c) Duplicate-event and idempotency unique constraints ----
+
+    await prisma.shippingEvent.create({
+      data: {
+        tenantId: tenant.id,
+        connectionId: connection.id,
+        externalEventId: `se-dup-${stamp}`,
+        eventType: "shipping.tracking.updated",
+        payload: {},
+        payloadSha256: "sha",
+      },
+    });
+
+    const dupEvent = await prisma.shippingEvent
+      .create({
+        data: {
+          tenantId: tenant.id,
+          connectionId: connection.id,
+          externalEventId: `se-dup-${stamp}`,
+          eventType: "shipping.tracking.updated",
+          payload: {},
+          payloadSha256: "sha",
+        },
+      })
+      .then(() => null)
+      .catch((error: unknown) => error as { code?: string });
+
+    assert(dupEvent?.code === "P2002", "duplicate (connectionId, externalEventId) must violate uniqueness");
+
+    const dupRequest = await prisma.shippingOutboundRequest
+      .create({
+        data: {
+          tenantId: tenant.id,
+          storeId: store.id,
+          connectionId: connection.id,
+          fulfillmentId,
+          kind: "SHIPMENT_CREATE",
+          idempotencyKey: `ship-${fulfillmentId}`,
+        },
+      })
+      .then(() => null)
+      .catch((error: unknown) => error as { code?: string });
+
+    assert(dupRequest?.code === "P2002", "duplicate (connectionId, idempotencyKey) must violate uniqueness");
+
     // ---- (6) RLS tenant isolation on the new tables ----
 
     const visibleEvents = await prisma.runAsTenant(tenant.id, () =>
@@ -448,7 +670,12 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+// The provisioning/flow context is system-bypass (seed rows and read them
+// back without ambient tenant stamps); every service still establishes its
+// own tenant/system context internally, so RLS is exercised for real.
+tenantContextStorage
+  .run({ bypass: true }, () => main())
+  .catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });

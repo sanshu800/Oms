@@ -47,6 +47,7 @@ describe("ShippingEventProcessorService", () => {
     deliverShipment: vi.fn(),
     cancelShipment: vi.fn(),
     cancel: vi.fn(),
+    complete: vi.fn(),
     getById: vi.fn(),
   };
 
@@ -140,9 +141,11 @@ describe("ShippingEventProcessorService", () => {
     fulfillmentService.deliverShipment.mockResolvedValue({});
     fulfillmentService.cancelShipment.mockResolvedValue({});
     fulfillmentService.cancel.mockResolvedValue({});
+    fulfillmentService.complete.mockResolvedValue({ id: "fulfillment-1", status: "FULFILLED" });
     fulfillmentService.getById.mockResolvedValue({
       id: "fulfillment-1",
       status: "IN_PROGRESS",
+      shipments: [],
     });
     auditService.recordEvent.mockResolvedValue({});
 
@@ -430,6 +433,135 @@ describe("ShippingEventProcessorService", () => {
 
     expect(fulfillmentService.cancelShipment).not.toHaveBeenCalled();
     expect(fulfillmentService.cancel).not.toHaveBeenCalled();
+  });
+
+  // ============================================================
+  // Cancellation semantics on partially shipped fulfillments
+  // (Stage 2.1): preserve completed shipment history, prevent
+  // incorrect inventory release.
+  // ============================================================
+
+  it("on a PARTIALLY SHIPPED fulfillment: cancels only the target shipment, preserves shipped history, releases NOTHING, and flags reconciliation", async () => {
+    seedEvent(
+      wire(ShippingWireEventType.CANCELLATION_CONFIRMED, "cancelled"),
+      ShippingWireEventType.CANCELLATION_CONFIRMED,
+    );
+    seedShipment({ status: ShipmentStatus.LABEL_CREATED });
+
+    // The fulfillment already has a physically shipped sibling.
+    fulfillmentService.getById.mockResolvedValue({
+      id: "fulfillment-1",
+      status: "PARTIALLY_FULFILLED",
+      shipments: [
+        { id: "shipment-0", status: ShipmentStatus.IN_TRANSIT },
+        { id: "shipment-1", status: ShipmentStatus.LABEL_CREATED },
+      ],
+    });
+
+    await service.processEvent("event-1");
+
+    // Only the cancelled shipment transitions — history preserved.
+    expect(fulfillmentService.cancelShipment).toHaveBeenCalledTimes(1);
+    expect(fulfillmentService.cancelShipment).toHaveBeenCalledWith(
+      expect.objectContaining({ shipmentId: "shipment-1" }),
+    );
+    expect(fulfillmentService.shipShipment).not.toHaveBeenCalled();
+    expect(fulfillmentService.deliverShipment).not.toHaveBeenCalled();
+
+    // NEVER release inventory once units have shipped: releaseOrder frees
+    // whole ACTIVE reservations (shipped units included) — an over-release.
+    expect(fulfillmentService.cancel).not.toHaveBeenCalled();
+
+    // The discrepancy is flagged for reconciliation.
+    expect(prisma.shipment.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "shipment-1" },
+        data: expect.objectContaining({
+          needsReconciliation: true,
+          reconciliationReason: expect.stringContaining("partially shipped"),
+        }),
+      }),
+    );
+  });
+
+  it("when siblings are live but nothing has shipped: cancels only the target, releases NOTHING (would free sibling reservations), and does not flag", async () => {
+    seedEvent(
+      wire(ShippingWireEventType.CANCELLATION_CONFIRMED, "cancelled"),
+      ShippingWireEventType.CANCELLATION_CONFIRMED,
+    );
+    seedShipment({ status: ShipmentStatus.CREATED });
+
+    fulfillmentService.getById.mockResolvedValue({
+      id: "fulfillment-1",
+      status: "IN_PROGRESS",
+      shipments: [
+        { id: "shipment-0", status: ShipmentStatus.CREATED },
+        { id: "shipment-1", status: ShipmentStatus.CREATED },
+      ],
+    });
+
+    await service.processEvent("event-1");
+
+    expect(fulfillmentService.cancelShipment).toHaveBeenCalledTimes(1);
+    expect(fulfillmentService.cancel).not.toHaveBeenCalled();
+
+    // No state conflict — an audit record, not a reconciliation flag.
+    expect(prisma.shipment.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ needsReconciliation: true }),
+      }),
+    );
+    expect(auditService.recordEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ action: "SHIPPING_SHIPMENT_CANCELLED" }),
+    );
+  });
+
+  it("when the cancelled shipment is the last live one and nothing shipped: full cancel and a CORRECT inventory release", async () => {
+    seedEvent(
+      wire(ShippingWireEventType.CANCELLATION_CONFIRMED, "cancelled"),
+      ShippingWireEventType.CANCELLATION_CONFIRMED,
+    );
+    seedShipment({ status: ShipmentStatus.LABEL_CREATED });
+
+    fulfillmentService.getById.mockResolvedValue({
+      id: "fulfillment-1",
+      status: "IN_PROGRESS",
+      shipments: [
+        // Only cancelled siblings remain: every unit is still in the
+        // warehouse, so releaseOrder is correct here.
+        { id: "shipment-0", status: ShipmentStatus.CANCELLED },
+        { id: "shipment-1", status: ShipmentStatus.LABEL_CREATED },
+      ],
+    });
+
+    await service.processEvent("event-1");
+
+    expect(fulfillmentService.cancelShipment).toHaveBeenCalledTimes(1);
+    expect(fulfillmentService.cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("commits inventory (complete) BEFORE the SHIP transition at handover — the canonical FULFILLING->FULFILLED order", async () => {
+    seedEvent(
+      wire(ShippingWireEventType.TRACKING_UPDATED, "in_transit"),
+      ShippingWireEventType.TRACKING_UPDATED,
+    );
+    seedShipment();
+
+    await service.processEvent("event-1");
+
+    expect(fulfillmentService.complete).toHaveBeenCalledTimes(1);
+    expect(fulfillmentService.shipShipment).toHaveBeenCalledTimes(1);
+
+    // complete() (inventory COMMIT) must precede shipShipment() (inventory
+    // SHIP): the reverse order makes shipOrder a silent no-op against the
+    // real InventoryService (COMMITTED -> SHIPPED) and strands reservations.
+    expect(
+      (fulfillmentService.complete as ReturnType<typeof vi.fn>).mock
+        .invocationCallOrder[0]!,
+    ).toBeLessThan(
+      (fulfillmentService.shipShipment as ReturnType<typeof vi.fn>).mock
+        .invocationCallOrder[0]!,
+    );
   });
 
   // ============================================================

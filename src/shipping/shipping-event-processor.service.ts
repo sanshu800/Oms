@@ -435,12 +435,27 @@ export class ShippingEventProcessorService {
         await this.noteProviderArtifacts(shipment.id, wireEvent);
 
         // ONLY verified carrier handover marks the shipment in transit.
+        // Order of domain calls is load-bearing: `complete()` performs the
+        // inventory COMMIT (ACTIVE -> COMMITTED) when everything is
+        // allocated to shipments, and `shipShipment` performs the inventory
+        // SHIP (COMMITTED -> SHIPPED). Committing first is the same
+        // sequence the canonical order flow uses (FULFILLING -> FULFILLED);
+        // the reverse order would make shipOrder a silent no-op and strand
+        // reservations at COMMITTED.
+        //
         // Duplicates and already-delivered states converge without
-        // re-applying inventory transitions (shipShipment early-returns).
+        // re-applying inventory transitions (complete/shipShipment
+        // early-return).
         if (
           shipment.status === ShipmentStatus.CREATED ||
           shipment.status === ShipmentStatus.LABEL_CREATED
         ) {
+          await this.fulfillmentService.complete({
+            tenantId: shipment.tenantId,
+            storeId: shipment.storeId,
+            fulfillmentId: shipment.fulfillmentId,
+          });
+
           await this.fulfillmentService.shipShipment({
             tenantId: shipment.tenantId,
             storeId: shipment.storeId,
@@ -481,11 +496,18 @@ export class ShippingEventProcessorService {
 
         // Delivery is carrier evidence that possession happened: an
         // out-of-order delivery (before any handover event) may pass
-        // through IN_TRANSIT, but only ever via verified evidence.
+        // through IN_TRANSIT, but only ever via verified evidence. The
+        // commit-then-ship order matches record_handover_confirmed.
         if (
           shipment.status === ShipmentStatus.CREATED ||
           shipment.status === ShipmentStatus.LABEL_CREATED
         ) {
+          await this.fulfillmentService.complete({
+            tenantId: shipment.tenantId,
+            storeId: shipment.storeId,
+            fulfillmentId: shipment.fulfillmentId,
+          });
+
           await this.fulfillmentService.shipShipment({
             tenantId: shipment.tenantId,
             storeId: shipment.storeId,
@@ -579,7 +601,8 @@ export class ShippingEventProcessorService {
           break;
         }
 
-        // CREATED / LABEL_CREATED: the confirmed cancellation applies.
+        // CREATED / LABEL_CREATED: the confirmed cancellation applies to
+        // THIS shipment only.
         await this.prisma.shipment.update({
           where: { id: shipment.id },
           data: {
@@ -593,20 +616,86 @@ export class ShippingEventProcessorService {
           },
         });
 
+        // History-preserving: only the cancelled shipment transitions to
+        // CANCELLED. Sibling shipments (including delivered ones) keep
+        // their rows, items, and shipped bookkeeping untouched.
         await this.fulfillmentService.cancelShipment({
           tenantId: shipment.tenantId,
           storeId: shipment.storeId,
           shipmentId: shipment.id,
         });
 
-        // Release the order when nothing has shipped yet (cancel() itself
-        // guards READY|IN_PROGRESS and releases the reservations).
         const fulfillment = await this.fulfillmentService.getById({
           tenantId: shipment.tenantId,
           storeId: shipment.storeId,
           fulfillmentId: shipment.fulfillmentId,
         });
 
+        const siblings = (fulfillment.shipments ?? []).filter(
+          (sibling: { id: string; status: ShipmentStatus }) =>
+            sibling.id !== shipment.id,
+        );
+
+        const physicallyShipped =
+          siblings.some(
+            (sibling: { status: ShipmentStatus }) =>
+              sibling.status === ShipmentStatus.IN_TRANSIT ||
+              sibling.status === ShipmentStatus.DELIVERED,
+          ) ||
+          fulfillment.status === FulfillmentStatus.PARTIALLY_FULFILLED ||
+          fulfillment.status === FulfillmentStatus.FULFILLED;
+
+        const otherLive = siblings.some(
+          (sibling: { status: ShipmentStatus }) =>
+            sibling.status !== ShipmentStatus.CANCELLED,
+        );
+
+        if (physicallyShipped) {
+          // PARTIALLY SHIPPED FULFILLMENT: units have already left the
+          // warehouse. Releasing the order's reservations here would
+          // return already-shipped units to stock (`releaseOrder` releases
+          // whole ACTIVE reservations, which cover shipped and unshipped
+          // units alike), and cancelling the fulfillment would erase a
+          // partially-shipped state that is still in progress. Preserve
+          // the committed history; leave remainder handling to an
+          // operator — flagged for reconciliation.
+          await this.flagReconciliation(
+            shipment,
+            event,
+            "Cancellation confirmed for a shipment on a partially shipped fulfillment; shipped history preserved and no inventory released",
+          );
+
+          break;
+        }
+
+        if (otherLive) {
+          // Nothing has shipped yet, but sibling shipments are still
+          // allocated: releasing the order would free THEIR reservations
+          // too. No inventory movement; the audit record keeps the
+          // decision traceable.
+          await this.auditService.recordEvent({
+            tenantId: event.tenantId,
+            storeId: shipment.storeId,
+            action: "SHIPPING_SHIPMENT_CANCELLED",
+            actorType: AuditActorType.INTEGRATION,
+            entityType: "SHIPMENT",
+            entityId: shipment.id,
+            metadata: {
+              shippingEventId: event.id,
+              externalEventId: event.externalEventId,
+              fulfillmentId: shipment.fulfillmentId,
+              reason:
+                "sibling shipments still live; fulfillment kept and no inventory released",
+            },
+          });
+
+          break;
+        }
+
+        // Nothing shipped anywhere and no live siblings: a full
+        // cancellation is safe — the fulfillment is cancelled and the
+        // order's remaining ACTIVE reservations are released (correct
+        // here: every unit is still in the warehouse).
         if (
           fulfillment.status === FulfillmentStatus.READY ||
           fulfillment.status === FulfillmentStatus.IN_PROGRESS

@@ -590,6 +590,20 @@ export class WmsEventProcessorService {
           items,
         });
 
+        // Inventory ordering is load-bearing: `complete()` performs the
+        // inventory COMMIT (ACTIVE -> COMMITTED) once every unit is
+        // allocated to shipments, and `shipShipment` then performs the
+        // SHIP transition (COMMITTED -> SHIPPED) — the same sequence the
+        // canonical order flow uses (FULFILLING -> FULFILLED). Reversing
+        // the two would make shipOrder a silent no-op and strand
+        // reservations at COMMITTED. complete() also validates the
+        // partial-band rule before anything transitions.
+        const completed = await this.fulfillmentService.complete({
+          tenantId: event.tenantId,
+          storeId: request.storeId,
+          fulfillmentId: fulfillment.id,
+        });
+
         // Handover to the carrier: IN_TRANSIT. A tracking number alone is
         // never what moves this state — the warehouse handover is.
         await this.fulfillmentService.shipShipment({
@@ -621,13 +635,6 @@ export class WmsEventProcessorService {
             },
           });
         }
-
-        // PARTIALLY_FULFILLED or FULFILLED (inventory commits on full).
-        const completed = await this.fulfillmentService.complete({
-          tenantId: event.tenantId,
-          storeId: request.storeId,
-          fulfillmentId: fulfillment.id,
-        });
 
         await this.prisma.wmsFulfillmentRequest.update({
           where: { id: request.id },

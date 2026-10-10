@@ -259,6 +259,37 @@ function inMemoryDb() {
           },
         };
       },
+      findMany: async ({
+        where,
+      }: {
+        where: Record<string, unknown>;
+        select?: unknown;
+      }) => {
+        const shipmentCondition = (where as { shipment: { status: unknown } })
+          .shipment;
+        const fulfillmentId = (
+          where as { fulfillmentItem: { fulfillmentId: string } }
+        ).fulfillmentItem.fulfillmentId;
+
+        return tables.shipments
+          .filter((s) => matches(s, shipmentCondition))
+          .flatMap((s) => s.items as Row[])
+          .filter((si) => {
+            const fi = tables.fulfillments
+              .flatMap((f) => f.items as Row[])
+              .find((item) => item.id === si.fulfillmentItemId);
+
+            return (
+              fi &&
+              tables.fulfillments.find((f) => (f.items as Row[]).includes(fi))
+                ?.id === fulfillmentId
+            );
+          })
+          .map((si) => ({
+            fulfillmentItemId: si.fulfillmentItemId,
+            quantity: si.quantity,
+          }));
+      },
     },
 
     shippingConnection: {
@@ -781,6 +812,77 @@ describe("Shipping foundation end-to-end (fake shipping provider, real services)
       (e) => e.externalEventId === "se-handover",
     )!;
     expect(String(quarantined.rejectionReason)).toContain("Out-of-order");
+  });
+
+  it("cancels an unshipped remainder on a PARTIALLY SHIPPED fulfillment: history preserved, no inventory release, flagged for reconciliation", async () => {
+    // Realistic mixed flow: a WMS-style shipment (2 of 3 units) hands over
+    // first, then the shipping-provider remainder (1 unit) is cancelled.
+    const fulfillmentItemId = (db.tables.fulfillments[0]!.items as Row[])[0]!
+      .id as string;
+
+    const shipmentA = await fulfillmentService.createShipment({
+      tenantId: "tenant-1",
+      storeId: "store-1",
+      fulfillmentId: "fulfillment-1",
+      externalShipmentId: "ext-A",
+      items: [{ fulfillmentItemId, quantity: 2 }],
+    });
+
+    // Handover of A: complete() sees 2 of 3 allocated -> PARTIALLY_FULFILLED
+    // (no inventory commit at this point), then IN_TRANSIT.
+    await deliver({
+      type: ShippingWireEventType.TRACKING_UPDATED,
+      externalEventId: "se-A-handover",
+      externalShipmentId: "ext-A",
+      status: "in_transit",
+    });
+
+    const shipmentB = await fulfillmentService.createShipment({
+      tenantId: "tenant-1",
+      storeId: "store-1",
+      fulfillmentId: "fulfillment-1",
+      externalShipmentId: "ext-B",
+      items: [{ fulfillmentItemId, quantity: 1 }],
+    });
+
+    expect(db.tables.fulfillments[0]!.status).toBe("PARTIALLY_FULFILLED");
+    expect(inventoryService.commitOrder).not.toHaveBeenCalled();
+    expect(inventoryService.releaseOrder).not.toHaveBeenCalled();
+
+    // The provider CONFIRMS cancellation of the unshipped remainder.
+    await deliver({
+      type: ShippingWireEventType.CANCELLATION_CONFIRMED,
+      externalEventId: "se-B-cancelled",
+      externalShipmentId: "ext-B",
+      status: "cancelled",
+    });
+
+    const a = db.tables.shipments.find((s) => s.id === shipmentA.id)!;
+    const b = db.tables.shipments.find((s) => s.id === shipmentB.id)!;
+
+    // Completed shipment history preserved: only the remainder is cancelled.
+    expect(b.status).toBe("CANCELLED");
+    expect(a.status).toBe("IN_TRANSIT");
+    expect(a.items).toHaveLength(1);
+    expect(db.tables.fulfillments[0]!.status).toBe("PARTIALLY_FULFILLED");
+
+    // No incorrect inventory release: the order's ACTIVE reservation covers
+    // shipped AND unshipped units — releasing it would return shipped units
+    // to stock. Nothing is released, nothing is committed or shipped twice.
+    expect(inventoryService.releaseOrder).not.toHaveBeenCalled();
+    expect(inventoryService.commitOrder).not.toHaveBeenCalled();
+    expect(inventoryService.shipOrder).toHaveBeenCalledTimes(1);
+
+    // Shipped bookkeeping still counts only the live shipment (2 of 3):
+    // cancelled shipments never pollute the sums, replays cannot double-count.
+    const sums = await fulfillmentService.getShippedQuantityByFulfillmentItem(
+      "fulfillment-1",
+    );
+    expect(sums.get(fulfillmentItemId)).toBe(2);
+
+    // Remainder handling is operator-owned: flagged for reconciliation.
+    expect(b.needsReconciliation).toBe(true);
+    expect(String(b.reconciliationReason)).toContain("partially shipped");
   });
 
   it("rejects cross-tenant events and unauthenticated deliveries without mutating state", async () => {
