@@ -8,6 +8,7 @@ import { OrderModule } from "../oms/order/order.module";
 import { AuditModule } from "../oms/audit/audit.module";
 import { ExceptionModule } from "../oms/exception/exception.module";
 import { ResolutionModule } from "../oms/resolution/resolution.module";
+import { ShippingModule } from "../shipping/shipping.module";
 import { WmsModule } from "../wms/wms.module";
 
 import {
@@ -29,6 +30,8 @@ import { parseRedisConnectionOptions } from "../config/redis-connection";
     ResolutionModule,
     // The shared integration worker also processes WMS event jobs.
     WmsModule,
+    // ...and shipping-provider event jobs.
+    ShippingModule,
 
     BullModule.forRootAsync({
       inject: [ConfigService],

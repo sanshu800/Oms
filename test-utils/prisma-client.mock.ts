@@ -192,4 +192,21 @@ export const WmsRequestStatus = {
   FAILED: "FAILED",
   CANCELLED: "CANCELLED",
 } as const;
+
+export const ShippingProvider = {
+  FAKE: "FAKE",
+  SHIPROCKET: "SHIPROCKET",
+} as const;
+
+export const ShippingRequestKind = {
+  SHIPMENT_CREATE: "SHIPMENT_CREATE",
+  SHIPMENT_CANCEL: "SHIPMENT_CANCEL",
+} as const;
+
+export const ShippingRequestStatus = {
+  PENDING: "PENDING",
+  SUCCEEDED: "SUCCEEDED",
+  FAILED: "FAILED",
+  CANCELLED: "CANCELLED",
+} as const;
 // </generated-enums>

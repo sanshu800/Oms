@@ -171,6 +171,10 @@ model Tenant {
   wmsFulfillmentRequests WmsFulfillmentRequest[]
   wmsEvents              WmsEvent[]
 
+  shippingConnections     ShippingConnection[]
+  shippingOutboundRequests ShippingOutboundRequest[]
+  shippingEvents          ShippingEvent[]
+
   aiInvestigations    AiInvestigation[]
   aiDecisionProposals AiDecisionProposal[]
   aiMemoryFacts       AiMemoryFact[]
@@ -255,6 +259,8 @@ model StoreConnection {
   shipments    Shipment[]
 
   wmsFulfillmentRequests WmsFulfillmentRequest[]
+
+  shippingOutboundRequests ShippingOutboundRequest[]
 
   @@unique([platform, externalStoreId])
   @@index([tenantId, status])
@@ -733,6 +739,8 @@ model Fulfillment {
 
   wmsRequests WmsFulfillmentRequest[]
 
+  shippingOutboundRequests ShippingOutboundRequest[]
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -832,7 +840,36 @@ model Shipment {
   shippedAt   DateTime?
   deliveredAt DateTime?
 
+  /// Shipping-provider bookkeeping (Stage 2). AWB/label/pickup artifacts
+  /// are NEVER shipping proof — only `status` transitions made by
+  /// FulfillmentService (via verified carrier-handover evidence) are.
+  awbCode        String?
+  labelUrl       String?
+  courierName    String?
+  externalOrderId String?
+
+  /// Provider-evidence timestamps (from verified events), distinct from
+  /// the canonical transition timestamps above.
+  handedOverAt DateTime?
+
+  /// Cancellation REQUEST bookkeeping — a soft state. The CONFIRMED
+  /// cancellation is `status = CANCELLED`; the two are deliberately
+  /// distinct and never conflated.
+  cancellationRequestedAt DateTime?
+  cancellationRequestRef  String?
+
+  /// Last normalized provider status seen (diagnostics only).
+  lastProviderStatus String?
+
+  /// Set when verified provider evidence conflicts with committed state
+  /// (e.g. cancellation confirmed after handover). Never auto-resolved.
+  needsReconciliation Boolean @default(false)
+  reconciliationReason String?
+
   items ShipmentItem[]
+
+  shippingEvents           ShippingEvent[]
+  shippingOutboundRequests ShippingOutboundRequest[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -1297,6 +1334,29 @@ enum WmsRequestStatus {
   CANCELLED
 }
 
+enum ShippingProvider {
+  /// Deterministic in-repo fake — the only registered adapter in Stage 2.
+  FAKE
+  /// Planned Stage 3 provider; registered only when its adapter lands.
+  SHIPROCKET
+}
+
+enum ShippingRequestKind {
+  SHIPMENT_CREATE
+  SHIPMENT_CANCEL
+}
+
+enum ShippingRequestStatus {
+  /// Row created as the idempotency anchor; adapter call not confirmed yet.
+  PENDING
+  /// Adapter accepted the request (result recorded).
+  SUCCEEDED
+  /// Adapter call failed (timeout/upstream error). Retryable with the
+  /// same idempotency key.
+  FAILED
+  CANCELLED
+}
+
 model WmsConnection {
   id String @id @default(uuid()) @db.Uuid
 
@@ -1464,4 +1524,146 @@ model WmsEvent {
 
   @@unique([connectionId, externalEventId])
   @@index([tenantId, connectionId, status, receivedAt])
+}
+
+// ============================================================
+// SHIPPING-PROVIDER INTEGRATION (Stage 2)
+// ============================================================
+//
+// Provider-neutral shipping boundary, deliberately separate from the WMS
+// boundary above. WMS owns warehouse stages (pick/pack/warehouse handover);
+// shipping providers own carrier facts (shipment creation, AWB, label,
+// courier handover, tracking, delivery, cancellation outcomes). The
+// canonical projection (Shipment/Order status) is written only through
+// FulfillmentService, and ONLY verified carrier-handover evidence marks a
+// shipment in transit. AWB/label/pickup artifacts never do.
+
+model ShippingConnection {
+  id String @id @default(uuid()) @db.Uuid
+
+  tenantId String @db.Uuid
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  provider ShippingProvider
+
+  /// The provider-side account identity (analogous to
+  /// WmsConnection.externalWarehouseId). Inbound deliveries resolve to a
+  /// connection through (provider, externalAccountId) plus the
+  /// per-connection secret check; nothing else identifies an account.
+  externalAccountId String
+
+  status StoreConnectionStatus @default(PENDING)
+
+  /// Outbound API credential, encrypted at rest (ENCRYPTION_KEY).
+  /// Never logged, never returned by any API.
+  encryptedApiKey String?
+
+  /// Inbound event signing secret, encrypted at rest (ENCRYPTION_KEY).
+  encryptedWebhookSecret String?
+
+  connectedAt    DateTime?
+  disconnectedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  requests ShippingOutboundRequest[]
+  events   ShippingEvent[]
+
+  @@unique([tenantId, provider, externalAccountId])
+  @@index([tenantId, status])
+}
+
+model ShippingOutboundRequest {
+  id String @id @default(uuid()) @db.Uuid
+
+  tenantId       String @db.Uuid
+  storeId        String @db.Uuid
+  connectionId   String @db.Uuid
+  fulfillmentId  String @db.Uuid
+  shipmentId     String? @db.Uuid
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  store StoreConnection @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  connection ShippingConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  fulfillment Fulfillment @relation(fields: [fulfillmentId], references: [id], onDelete: Cascade)
+
+  shipment Shipment? @relation(fields: [shipmentId], references: [id], onDelete: SetNull)
+
+  kind ShippingRequestKind
+
+  /// Deterministic idempotency key (e.g. `ship-${fulfillmentId}` /
+  /// `cancel-${shipmentId}`). Resubmits and worker retries reuse it, so a
+  /// provider can never be asked twice for the same logical operation.
+  idempotencyKey String
+
+  status ShippingRequestStatus @default(PENDING)
+
+  /// The provider's identity for the result (external shipment id, ...).
+  externalRequestId String?
+
+  /// Provider response summary (ids, AWB, label URL). No secret material.
+  responseJson Json?
+
+  lastError String?
+
+  succeededAt DateTime?
+  failedAt    DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([connectionId, idempotencyKey])
+  @@unique([connectionId, externalRequestId])
+  @@index([tenantId, storeId, status])
+  @@index([fulfillmentId])
+  @@index([shipmentId])
+}
+
+model ShippingEvent {
+  id String @id @default(uuid()) @db.Uuid
+
+  tenantId     String @db.Uuid
+  connectionId String @db.Uuid
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  connection ShippingConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  shipmentId String? @db.Uuid
+
+  shipment Shipment? @relation(fields: [shipmentId], references: [id], onDelete: SetNull)
+
+  /// The provider's id for this event. Durable idempotency key: a
+  /// duplicate delivery is acknowledged without being re-applied.
+  externalEventId String
+
+  /// Canonical wire event type (see shipping-status-mapping.ts). Unknown
+  /// types are durably recorded and rejected — never applied.
+  eventType String
+
+  payload       Json
+  payloadSha256 String
+
+  status WebhookStatus @default(RECEIVED)
+
+  attempts Int @default(0)
+
+  receivedAt  DateTime  @default(now())
+  processedAt DateTime?
+
+  lastError String?
+
+  /// Set when the event was durably recorded but deliberately NOT applied
+  /// (unknown type, unknown shipment, out-of-order transition, cross-tenant
+  /// reference, ...). Rejections never mutate domain state.
+  rejectionReason String?
+
+  @@unique([connectionId, externalEventId])
+  @@index([tenantId, connectionId, status, receivedAt])
+  @@index([shipmentId])
 }

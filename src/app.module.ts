@@ -15,6 +15,7 @@ import { InventoryModule } from "./oms/inventory/inventory.module";
 import { FulfillmentModule } from "./oms/fulfillment/fulfillment.module";
 import { RiskModule } from "./oms/risk/risk.module";
 import { ResolutionModule } from "./oms/resolution/resolution.module";
+import { ShippingModule } from "./shipping/shipping.module";
 import { WmsModule } from "./wms/wms.module";
 
 import { QueueModule } from "./queue/queue.module";
@@ -40,6 +41,7 @@ import { AiModule } from "./ai/ai.module";
     RiskModule,
     ResolutionModule,
     WmsModule,
+    ShippingModule,
 
     QueueModule,
 

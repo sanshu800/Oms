@@ -50,18 +50,21 @@
  *   same `mapShippingEventToCanonicalAction` reducer so projections cannot drift.
  */
 
+import { ShippingProvider } from "@prisma/client";
+
 export const SHIPPING_CONTRACT_VERSION = "1.0";
 
 export const SHIPPING_PROVIDER_TOKEN = Symbol("SHIPPING_PROVIDER");
 export const SHIPPING_ADAPTERS = Symbol("SHIPPING_ADAPTERS");
 
-/** BullMQ queue shared with the existing webhooks worker (dual dispatch). */
-export const SHIPPING_EVENT_QUEUE = "webhook-processing";
+/**
+ * DI token for the durable shipping-event queue port. Implemented on the
+ * EXISTING BullMQ infrastructure (src/queue/shipping-event.queue.ts) —
+ * same Redis, same retry/dead-letter options as webhook and WMS jobs.
+ */
+export const SHIPPING_EVENT_QUEUE = Symbol("SHIPPING_EVENT_QUEUE");
 
-export enum ShippingProvider {
-  FAKE = "FAKE",
-  SHIPROCKET = "SHIPROCKET",
-}
+export { ShippingProvider };
 
 export enum ShippingCapability {
   SHIPMENT_CREATE = "shipment.create",
@@ -266,18 +269,46 @@ export interface FetchShippingTrackingResult {
   raw?: unknown;
 }
 
+// ============================================================
+// Inbound delivery identity and verification (Stage 2 finalization)
+// ============================================================
+
+export type ReadShippingInboundHeaders = Record<
+  string,
+  string | string[] | undefined
+>;
+
+export type ReadShippingInboundInput = {
+  headers: ReadShippingInboundHeaders;
+  /** Raw request body — signatures are computed over these exact bytes. */
+  rawBody: Buffer;
+};
+
+/** Identity of one delivery, extracted from provider headers/body. */
 export interface ShippingInboundEnvelope {
+  /** The provider-side account identity (see ShippingConnection). */
+  externalAccountId: string;
   externalEventId: string;
   event: ShippingInboundEvent;
 }
 
-export interface ShippingConnectionSecrets {
-  /** Provider API credential material (e.g. Shiprocket API user email). */
-  apiEmail?: string;
-  /** Provider API password/token. Decrypted at runtime; never logged. */
-  apiPassword?: string;
-  /** Webhook verification secret shared with the provider. */
-  webhookSecret?: string;
+export type VerifyShippingInboundInput = {
+  /** Raw request body — signatures are computed over these exact bytes. */
+  rawBody: Buffer;
+  headers: ReadShippingInboundHeaders;
+  envelope: ShippingInboundEnvelope;
+  connection: { id: string; encryptedWebhookSecret: string | null };
+};
+
+/** Error raised by adapters for provider-side failures (incl. timeouts). */
+export class ShippingProviderError extends Error {
+  constructor(
+    public readonly code: "TIMEOUT" | "UPSTREAM_ERROR" | "INVALID_REQUEST",
+    message: string,
+  ) {
+    super(message);
+    this.name = "ShippingProviderError";
+  }
 }
 
 export interface ShippingProviderAdapter {
@@ -290,10 +321,25 @@ export interface ShippingProviderAdapter {
   fetchLabel?(request: FetchShippingLabelRequest): Promise<FetchShippingLabelResult>;
   fetchTracking?(request: FetchShippingTrackingRequest): Promise<FetchShippingTrackingResult>;
 
-  /** Parse a raw webhook body into the wire envelope (validates contract version). */
-  readInboundEnvelope(raw: unknown): ShippingInboundEnvelope;
-  /** Mandatory authenticity check before any parsing/persistence. */
-  verifyInbound(rawBody: Buffer | string, headers: Record<string, string | string[] | undefined>, secrets: ShippingConnectionSecrets): boolean;
+  /** Extract delivery identity + parse the wire event (validates contract version). */
+  readInboundEnvelope(input: ReadShippingInboundInput): ShippingInboundEnvelope;
+
+  /**
+   * Authenticate one raw delivery against the secret belonging to this
+   * connection. Returns true only when the signature verifies; throws on
+   * operational misconfiguration (e.g. undecryptable secret). Never
+   * persists anything; never logs secrets.
+   */
+  verifyInbound(input: VerifyShippingInboundInput): boolean;
+}
+
+/**
+ * Outbound port for durable shipping-event queueing (mirrors the WMS
+ * event queue port). Stage 2 introduces no new queue technology.
+ */
+export interface ShippingEventQueue {
+  enqueue(shippingEventId: string): Promise<void>;
+  requeue(shippingEventId: string): Promise<void>;
 }
 
 export function isShippingAdapter(value: unknown): value is ShippingProviderAdapter {
@@ -327,3 +373,17 @@ export const SHIPPING_STATUS_DESCRIPTIONS: Record<ShippingProviderStatus, string
   [ShippingProviderStatus.LOST]: "Shipment reported lost by the carrier.",
   [ShippingProviderStatus.UNKNOWN]: "Unrecognized provider status; raw value preserved in metadata.",
 };
+
+/** Resolves the registered adapter for a provider (one per provider). */
+export function shippingAdapterForProvider(
+  adapters: readonly ShippingProviderAdapter[],
+  provider: ShippingProvider,
+): ShippingProviderAdapter {
+  const adapter = adapters.find((candidate) => candidate.provider === provider);
+
+  if (!adapter) {
+    throw new Error(`No shipping adapter registered for provider ${provider}`);
+  }
+
+  return adapter;
+}
