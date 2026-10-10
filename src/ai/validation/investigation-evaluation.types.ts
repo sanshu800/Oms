@@ -23,6 +23,7 @@ export type CriterionId =
   | "evidence_grounding"
   | "uncertainty_on_missing_evidence"
   | "bounded_tool_calls"
+  | "low_confidence_flagged"
   | "untrusted_external_text"
   | "tenant_boundary";
 
@@ -91,13 +92,3 @@ export const KNOWN_ACTION_TYPES = [
   "ESCALATE_TO_HUMAN",
   "NO_ACTION_INSUFFICIENT_EVIDENCE",
 ] as const;
-
-/** Conclusions that honestly say "I don't know" instead of inventing. */
-export const UNCERTAINTY_ACTION_TYPES = [
-  "ESCALATE_TO_HUMAN",
-  "NO_ACTION_INSUFFICIENT_EVIDENCE",
-] as const;
-
-export function isUncertaintyConclusion(actionType: string): boolean {
-  return (UNCERTAINTY_ACTION_TYPES as readonly string[]).includes(actionType);
-}

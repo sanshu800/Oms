@@ -2,14 +2,17 @@ import { Injectable, Optional } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 
 import { PrismaService } from "../../prisma/prisma.service";
-import { REQUIRED_TARGET_ENTITY_TYPE } from "../investigation/ai-decision-proposal.schema";
+import { LOW_CONFIDENCE_THRESHOLD } from "../decision-model/decision-model.types";
+import {
+  REQUIRED_TARGET_ENTITY_TYPE,
+  isUncertaintyConclusion,
+} from "../investigation/ai-decision-proposal.schema";
 import {
   CriterionResult,
   EvidenceGroundingOutcome,
   InvestigationEvaluationReport,
   InvestigationMetrics,
   KNOWN_ACTION_TYPES,
-  isUncertaintyConclusion,
 } from "./investigation-evaluation.types";
 
 export type EvaluateInvestigationInput = {
@@ -67,11 +70,25 @@ export class InvestigationEvaluationService {
     });
 
     const errorText = investigation.error ?? null;
+    // Error outputs are NOT evidence: the pipeline records failed tool calls
+    // as string payloads or `{ error: ... }` output objects (see
+    // AiInvestigationService.logCall), and a failing dependency may echo
+    // arbitrary garbage — including other tenants' ids — on the wire.
+    // Grounding must come from successful, structured reads only.
+    const isErrorOutput = (output: unknown): boolean =>
+      typeof output === "string" ||
+      (typeof output === "object" &&
+        output !== null &&
+        !Array.isArray(output) &&
+        "error" in output);
+
     const haystack = JSON.stringify(
       investigation.toolCalls.map((call) => ({
         toolName: call.toolName,
         input: call.input,
-        output: call.output,
+        output: isErrorOutput(call.output)
+          ? { error: "tool call failed" }
+          : call.output,
       })),
     );
 
@@ -89,6 +106,7 @@ export class InvestigationEvaluationService {
       this.checkGrounding(grounding, proposals),
       this.checkUncertainty(grounding, proposals),
       this.checkBounded(investigation.toolCallCount, errorText),
+      this.checkLowConfidence(proposals),
       {
         id: "untrusted_external_text",
         status: "UNAVAILABLE",
@@ -385,6 +403,58 @@ export class InvestigationEvaluationService {
       status: "FAIL",
       detail:
         "Evidence was missing or unverifiable, but the run concluded a concrete action instead of stating uncertainty",
+    };
+  }
+
+  private checkLowConfidence(
+    proposals: Array<{
+      actionType: string;
+      confidence: unknown;
+      riskTier: unknown;
+    }>,
+  ): CriterionResult {
+    if (proposals.length === 0) {
+      return {
+        id: "low_confidence_flagged",
+        status: "UNAVAILABLE",
+        detail: "No proposals to assess",
+      };
+    }
+
+    const risky = proposals.filter((proposal) => {
+      const confidence =
+        typeof proposal.confidence === "number" ? proposal.confidence : null;
+      const highRisk = proposal.riskTier === "HIGH";
+
+      // Missing confidence metadata cannot be judged — flag as UNAVAILABLE
+      // below rather than inventing a value.
+      return confidence !== null && confidence < LOW_CONFIDENCE_THRESHOLD && highRisk;
+    });
+
+    const missingConfidence = proposals.some(
+      (proposal) => typeof proposal.confidence !== "number",
+    );
+
+    if (risky.length > 0) {
+      return {
+        id: "low_confidence_flagged",
+        status: "FAIL",
+        detail: `${risky.length} HIGH-risk proposal(s) carry confidence below ${LOW_CONFIDENCE_THRESHOLD} — low-confidence high-risk decisions must not pass evaluation silently`,
+      };
+    }
+
+    if (missingConfidence) {
+      return {
+        id: "low_confidence_flagged",
+        status: "UNAVAILABLE",
+        detail: "Confidence metadata missing on at least one proposal",
+      };
+    }
+
+    return {
+      id: "low_confidence_flagged",
+      status: "PASS",
+      detail: "No low-confidence HIGH-risk proposal present",
     };
   }
 

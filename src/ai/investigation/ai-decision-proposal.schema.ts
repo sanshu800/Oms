@@ -19,6 +19,16 @@ export const REQUIRED_TARGET_ENTITY_TYPE: Record<string, string> = {
   ADD_ORDER_NOTE: "ORDER",
 };
 
+/** Conclusions that honestly say "I don't know" instead of inventing. */
+export const UNCERTAINTY_ACTION_TYPES = [
+  "ESCALATE_TO_HUMAN",
+  "NO_ACTION_INSUFFICIENT_EVIDENCE",
+] as const;
+
+export function isUncertaintyConclusion(actionType: string): boolean {
+  return (UNCERTAINTY_ACTION_TYPES as readonly string[]).includes(actionType);
+}
+
 export const decisionProposalSchema = z
   .object({
     actionType: z.string().min(1),

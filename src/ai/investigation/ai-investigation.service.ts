@@ -1,6 +1,10 @@
 import { Inject, Injectable, Logger } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
-import { AuditActorType, Prisma } from "@prisma/client";
+import {
+  AiInvestigationStatus,
+  AuditActorType,
+  Prisma,
+} from "@prisma/client";
 
 import { PrismaService } from "../../prisma/prisma.service";
 import { ExceptionService } from "../../oms/exception/exception.service";
@@ -10,6 +14,7 @@ import { AiAutonomyService } from "../decision/ai-autonomy.service";
 import { LLM_CLIENT, LlmClient, LlmMessage } from "../llm/llm-client.interface";
 import {
   decisionProposalSchema,
+  isUncertaintyConclusion,
   submitDecisionProposalToolDefinition,
   SUBMIT_DECISION_PROPOSAL_TOOL,
 } from "./ai-decision-proposal.schema";
@@ -60,27 +65,77 @@ export class AiInvestigationService {
     const timeoutMs =
       this.config.get<number>("AI_INVESTIGATION_TIMEOUT_MS") ?? 30000;
 
-    return Promise.race([
-      this.runInvestigation(input),
-      new Promise<InvestigateResult>((_, reject) => {
-        setTimeout(
-          () => reject(new Error("Investigation timed out")),
-          timeoutMs,
-        );
-      }),
-    ]).catch(async (error) => {
+    // D1 hardening: the timeout CANCELLATES the run (flag + guarded status
+    // transitions) instead of racing it. One investigate() call produces
+    // exactly one investigation row and one terminal outcome — a timed-out
+    // run can never later publish a contradictory COMPLETED row or an
+    // unreviewed proposal.
+    let investigationId: string | null = null;
+    let timedOut = false;
+    let timer: NodeJS.Timeout | undefined;
+
+    const runContext = {
+      isCancelled: () => timedOut,
+      onRowCreated: (id: string) => {
+        investigationId = id;
+      },
+    };
+
+    const timeoutPromise = new Promise<InvestigateResult>((_, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        reject(new Error("Investigation timed out"));
+      }, timeoutMs);
+    });
+
+    try {
+      return await Promise.race([
+        this.runInvestigation(input, runContext),
+        timeoutPromise,
+      ]);
+    } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
 
       this.logger.error(
         `Investigation failed for exception ${input.exceptionId}: ${message}`,
       );
 
+      if (investigationId !== null) {
+        // The row exists: finalize IT (guarded — no second row, no
+        // double audit trail).
+        await this.markFailed(investigationId, message);
+
+        await this.auditService.recordEvent({
+          tenantId: input.tenantId,
+          storeId: input.storeId,
+          action: "AI_INVESTIGATION_FAILED",
+          actorType: AuditActorType.AI_AGENT,
+          entityType: "OPERATIONAL_EXCEPTION",
+          entityId: input.exceptionId,
+          metadata: { investigationId, error: message },
+        });
+
+        return {
+          investigationId,
+          status: "FAILED",
+          error: message,
+        };
+      }
+
       return this.failWithoutInvestigationRow(input, message);
-    });
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    }
   }
 
   private async runInvestigation(
     input: InvestigateInput,
+    runContext: {
+      isCancelled: () => boolean;
+      onRowCreated: (id: string) => void;
+    },
   ): Promise<InvestigateResult> {
     const exception = await this.exceptionService.getById(input);
 
@@ -89,6 +144,16 @@ export class AiInvestigationService {
         input,
         "Operational exception not found in this tenant/store",
       );
+    }
+
+    if (runContext.isCancelled()) {
+      // Timed out before the row was created — the caller's failure path
+      // already recorded the outcome; do not create a second row.
+      return {
+        investigationId: "",
+        status: "FAILED",
+        error: "Investigation timed out",
+      };
     }
 
     const maxToolCalls =
@@ -104,6 +169,8 @@ export class AiInvestigationService {
         model,
       },
     });
+
+    runContext.onRowCreated(investigation.id);
 
     try {
       const result = await this.runToolLoop(
@@ -201,6 +268,10 @@ export class AiInvestigationService {
     let toolCallSequence = 0;
     let totalTokens = 0;
     let invalidProposalAttempts = 0;
+    // Evidence provenance ledger: everything the read tools returned in
+    // this investigation. Proposals must ground their target and evidence
+    // references in it (D2) — the same rule the evaluation service applies.
+    let evidenceHaystack = "";
 
     for (let iteration = 0; iteration < maxToolCalls; iteration++) {
       const completion = await this.llmClient.createChatCompletion({
@@ -263,33 +334,93 @@ export class AiInvestigationService {
             continue;
           }
 
-          const proposal = await this.prisma.aiDecisionProposal.create({
-            data: {
-              tenantId: input.tenantId,
-              storeId: input.storeId,
-              exceptionId: input.exceptionId,
-              investigationId,
-              actionType: parsed.data.actionType,
-              targetEntityType: parsed.data.targetEntityType,
-              targetEntityId: parsed.data.targetEntityId,
-              params: parsed.data.params as Prisma.InputJsonValue,
-              confidence: parsed.data.confidence,
-              basis: parsed.data.basis,
-              riskTier: parsed.data.riskTier,
-              reasoningSummary: parsed.data.reasoningSummary,
-              evidenceRefs: parsed.data.evidenceRefs,
-            },
+          // D2: provenance check before anything is persisted. A target or
+          // evidence reference that never appeared in retrieved tool
+          // output is a fabrication — rejected like an invalid proposal
+          // (retryable feedback, bounded by MAX_INVALID_PROPOSAL_ATTEMPTS).
+          const groundingIssue = this.checkProposalGrounding(
+            parsed.data,
+            evidenceHaystack,
+            input.exceptionId,
+          );
+
+          if (groundingIssue) {
+            invalidProposalAttempts += 1;
+
+            if (invalidProposalAttempts > MAX_INVALID_PROPOSAL_ATTEMPTS) {
+              await this.prisma.aiInvestigation.update({
+                where: { id: investigationId },
+                data: {
+                  toolCallCount: toolCallSequence,
+                  tokensUsed: totalTokens,
+                },
+              });
+
+              return {
+                status: "FAILED",
+                error: `Model submitted an invalid decision proposal ${invalidProposalAttempts} times and did not correct it: ${groundingIssue}`,
+              };
+            }
+
+            messages.push({
+              role: "tool",
+              toolCallId: call.id,
+              name: call.name,
+              content: `Invalid proposal: ${groundingIssue}. Please correct and resubmit.`,
+            });
+
+            continue;
+          }
+
+          // D1: the COMPLETED transition CLAIMS the RUNNING row inside the
+          // same transaction that persists the proposal. If the run was
+          // cancelled (timeout) or already finalized, the claim fails, the
+          // proposal is rolled back, and nothing contradictory is published.
+          const proposalId = await this.prisma.$transaction(async (tx) => {
+            const claimed = await tx.aiInvestigation.updateMany({
+              where: {
+                id: investigationId,
+                status: AiInvestigationStatus.RUNNING,
+              },
+              data: {
+                status: AiInvestigationStatus.COMPLETED,
+                completedAt: new Date(),
+                toolCallCount: toolCallSequence,
+                tokensUsed: totalTokens,
+              },
+            });
+
+            if (claimed.count !== 1) {
+              return null;
+            }
+
+            const proposal = await tx.aiDecisionProposal.create({
+              data: {
+                tenantId: input.tenantId,
+                storeId: input.storeId,
+                exceptionId: input.exceptionId,
+                investigationId,
+                actionType: parsed.data.actionType,
+                targetEntityType: parsed.data.targetEntityType,
+                targetEntityId: parsed.data.targetEntityId,
+                params: parsed.data.params as Prisma.InputJsonValue,
+                confidence: parsed.data.confidence,
+                basis: parsed.data.basis,
+                riskTier: parsed.data.riskTier,
+                reasoningSummary: parsed.data.reasoningSummary,
+                evidenceRefs: parsed.data.evidenceRefs,
+              },
+            });
+
+            return proposal.id;
           });
 
-          await this.prisma.aiInvestigation.update({
-            where: { id: investigationId },
-            data: {
-              status: "COMPLETED",
-              completedAt: new Date(),
-              toolCallCount: toolCallSequence,
-              tokensUsed: totalTokens,
-            },
-          });
+          if (proposalId === null) {
+            return {
+              status: "FAILED",
+              error: "Investigation timed out before the proposal could be recorded",
+            };
+          }
 
           // Recommend-only remains the default outcome. This only
           // does anything if the tenant has explicitly opted a
@@ -298,10 +429,10 @@ export class AiInvestigationService {
           await this.aiAutonomyService.maybeAutoExecute({
             tenantId: input.tenantId,
             storeId: input.storeId,
-            proposalId: proposal.id,
+            proposalId,
           });
 
-          return { status: "COMPLETED", proposalId: proposal.id };
+          return { status: "COMPLETED", proposalId };
         }
 
         // A genuine read tool call.
@@ -312,6 +443,11 @@ export class AiInvestigationService {
         );
 
         toolCallSequence += 1;
+
+        evidenceHaystack += `${JSON.stringify({
+          input: call.arguments,
+          output,
+        })}\n`;
 
         await this.prisma.aiToolCall.create({
           data: {
@@ -347,11 +483,50 @@ export class AiInvestigationService {
     };
   }
 
+  /**
+   * D2 provenance rule (same as InvestigationEvaluationService's grounding
+   * criterion): the target entity must appear in retrieved tool output —
+   * except uncertainty-class conclusions, which may target the exception
+   * itself — and every evidenceRef must appear in tool output or be the
+   * exception id. Fabricated ids are rejected; they are never persisted.
+   */
+  private checkProposalGrounding(
+    proposal: {
+      actionType: string;
+      targetEntityId: string;
+      evidenceRefs: string[];
+    },
+    evidenceHaystack: string,
+    exceptionId: string,
+  ): string | null {
+    const targetObserved =
+      evidenceHaystack.includes(proposal.targetEntityId) ||
+      (isUncertaintyConclusion(proposal.actionType) &&
+        proposal.targetEntityId === exceptionId);
+
+    if (!targetObserved) {
+      return `targetEntityId "${proposal.targetEntityId}" does not appear in the evidence retrieved in this investigation (tool outputs). Use an id returned by get_exception_context, get_order_detail, or another read tool`;
+    }
+
+    for (const ref of proposal.evidenceRefs) {
+      if (ref !== exceptionId && !evidenceHaystack.includes(ref)) {
+        return `evidenceRef "${ref}" does not appear in the evidence retrieved in this investigation (tool outputs)`;
+      }
+    }
+
+    return null;
+  }
+
   private async markFailed(investigationId: string, error: string) {
-    await this.prisma.aiInvestigation.update({
-      where: { id: investigationId },
+    // Guarded transition: only a RUNNING investigation can fail. A late
+    // (cancelled/orphaned) finisher must never overwrite a terminal state.
+    await this.prisma.aiInvestigation.updateMany({
+      where: {
+        id: investigationId,
+        status: AiInvestigationStatus.RUNNING,
+      },
       data: {
-        status: "FAILED",
+        status: AiInvestigationStatus.FAILED,
         completedAt: new Date(),
         error,
       },

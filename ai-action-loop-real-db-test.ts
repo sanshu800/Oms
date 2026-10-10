@@ -487,12 +487,23 @@ async function main() {
 
     // Second investigation: release the HELD order's reservation so the
     // blocked order can be re-reserved — the inventory-state resolution.
+    //
+    // NOTE (task 13 provenance hardening): the submit targets
+    // `heldOrder.id`, so the scripted model must first OBSERVE that id in a
+    // read-tool output (D2: proposals may only target entities grounded in
+    // retrieved evidence). The model "heard about" the held order and
+    // verifies it with get_order_detail before proposing its release —
+    // exactly the provenance the pipeline now enforces.
     scriptedLlm.setScript([
       {
         toolCalls: [
           {
             name: "get_exception_context",
             arguments: { exceptionId: exception.id },
+          },
+          {
+            name: "get_order_detail",
+            arguments: { orderId: heldOrder.id },
           },
         ],
       },
@@ -739,9 +750,17 @@ async function main() {
       }),
     );
 
+    // The scripted model OBSERVES orderC via a read tool (D2 provenance:
+    // targets must be grounded in retrieved evidence) — the proposal is
+    // stale/incorrect because inventory advanced, not because the id is
+    // fabricated. Revalidation — not provenance — must stop it.
     scriptedLlm.setScript([
       {
         toolCalls: [
+          {
+            name: "get_order_detail",
+            arguments: { orderId: orderC.id },
+          },
           {
             name: "submit_decision_proposal",
             arguments: {
@@ -754,7 +773,7 @@ async function main() {
               riskTier: "HIGH",
               reasoningSummary:
                 "Stale/incorrect proposal naming an order whose inventory has advanced.",
-              evidenceRefs: [exception.id],
+              evidenceRefs: [exception.id, orderC.id],
             },
           },
         ],
@@ -799,9 +818,16 @@ async function main() {
 
     const mismatchNote = `TechMart: verification-mismatch probe ${stamp}.`;
 
+    // The model re-reads the exception context before proposing (D2
+    // provenance: targets must be grounded in retrieved evidence — the
+    // context output exposes failedOrder.id).
     scriptedLlm.setScript([
       {
         toolCalls: [
+          {
+            name: "get_exception_context",
+            arguments: { exceptionId: exception.id },
+          },
           {
             name: "submit_decision_proposal",
             arguments: {
@@ -813,7 +839,7 @@ async function main() {
               basis: "HEURISTIC",
               riskTier: "LOW",
               reasoningSummary: "Note write whose external verification will disagree.",
-              evidenceRefs: [exception.id],
+              evidenceRefs: [exception.id, failedOrder.id],
             },
           },
         ],
@@ -942,10 +968,16 @@ async function main() {
     );
 
     // (9b) Model corrects after one rejection → proposal persisted
-    // (the schema guard actively protects proposal creation).
+    // (the schema guard actively protects proposal creation). The model
+    // reads the exception context first so its corrected target is
+    // grounded in retrieved evidence (D2 provenance).
     scriptedLlm.setScript([
       {
         toolCalls: [
+          {
+            name: "get_exception_context",
+            arguments: { exceptionId: exception.id },
+          },
           {
             name: "submit_decision_proposal",
             arguments: {
@@ -974,6 +1006,7 @@ async function main() {
               basis: "HEURISTIC",
               riskTier: "LOW",
               reasoningSummary: "Corrected after schema rejection.",
+              evidenceRefs: [exception.id, failedOrder.id],
             },
           },
         ],
