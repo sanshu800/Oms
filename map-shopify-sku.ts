@@ -123,15 +123,17 @@ async function asOperator<T>(
 }
 
 async function resolveStore(shop: string) {
-  const store = await prisma.storeConnection.findUnique({
-    where: {
-      platform_externalStoreId: {
-        platform: "SHOPIFY",
-        externalStoreId: shop,
+  const store = await asOperator((tx) =>
+    tx.storeConnection.findUnique({
+      where: {
+        platform_externalStoreId: {
+          platform: "SHOPIFY",
+          externalStoreId: shop,
+        },
       },
-    },
-    select: { id: true, tenantId: true, status: true, externalStoreId: true },
-  });
+      select: { id: true, tenantId: true, status: true, externalStoreId: true },
+    }),
+  );
 
   if (!store) {
     fail(

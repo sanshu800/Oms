@@ -14,7 +14,7 @@ import { z } from "zod";
  * (e.g. the exception instead of the order) would otherwise look
  * identical to a correct proposal until someone actually approved it.
  */
-const REQUIRED_TARGET_ENTITY_TYPE: Record<string, string> = {
+export const REQUIRED_TARGET_ENTITY_TYPE: Record<string, string> = {
   RELEASE_ORDER_RESERVATION: "ORDER",
   ADD_ORDER_NOTE: "ORDER",
 };

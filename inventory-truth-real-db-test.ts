@@ -1,6 +1,7 @@
-﻿import { NestFactory } from "@nestjs/core";
+import { NestFactory } from "@nestjs/core";
 import { AppModule } from "./src/app.module";
 import { PrismaService } from "./src/prisma/prisma.service";
+import { tenantContextStorage } from "./src/prisma/tenant-context";
 import { InventoryTruthService } from "./src/oms/inventory/inventory-truth.service";
 
 async function main() {
@@ -48,7 +49,9 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+// Runs as operator (RLS bypass): this verification script is not scoped
+// to one tenant session. The truth lookup itself passes the tenant.
+tenantContextStorage.run({ bypass: true }, () => main()).catch((error) => {
   console.error(
     error instanceof Error ? error.message : error,
   );

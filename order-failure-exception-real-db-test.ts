@@ -1,6 +1,7 @@
-﻿import { NestFactory } from "@nestjs/core";
+import { NestFactory } from "@nestjs/core";
 import { AppModule } from "./src/app.module";
 import { PrismaService } from "./src/prisma/prisma.service";
+import { tenantContextStorage } from "./src/prisma/tenant-context";
 import { OrderService } from "./src/oms/order/order.service";
 import { ShopifyConnector } from "./src/connectors/shopify/shopify.connector";
 
@@ -69,7 +70,7 @@ async function main() {
       orderNumber,
     }, null, 2));
 
-    let orderId: string | null = null;
+    let _orderId: string | null = null;
 
     try {
       const connector = new ShopifyConnector({} as never, {} as never);
@@ -134,7 +135,7 @@ async function main() {
       throw new Error("TEST FAILED: OMS order was not persisted.");
     }
 
-    orderId = order.id;
+    _orderId = order.id;
 
     const failedItem = order.items[0];
 
@@ -247,7 +248,10 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+// Runs as operator (RLS bypass): this script reads across the seeded lab
+// store's rows and is not scoped to one tenant session. Service calls
+// inside set their own tenant context per operation.
+tenantContextStorage.run({ bypass: true }, () => main()).catch((error) => {
   console.error(
     "REAL ORDER FAILURE -> EXCEPTION VERIFICATION FAILED",
   );

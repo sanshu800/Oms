@@ -344,20 +344,25 @@ async function main() {
       select: { id: true, externalStoreId: true, status: true, tenantId: true },
     });
 
-    return { store, tenantId: resolvedTenantId };
+    // Issue the tenant API key inside the same bypass transaction:
+    // TenantApiKey is FORCE ROW LEVEL SECURITY, and the transaction-local
+    // app.bypass_rls set above is the only context this raw client gets.
+    let issuedKey: string | null = null;
+
+    if (!existing) {
+      const service = new TenantApiKeyService(tx as unknown as PrismaService);
+      const issued = await service.issueKey({
+        tenantId: resolvedTenantId,
+        label: options.label ?? `${shop} — custom app connection`,
+      });
+
+      issuedKey = issued.rawKey;
+    }
+
+    return { store, tenantId: resolvedTenantId, issuedKey };
   });
 
-  let apiKey: string | null = null;
-
-  if (!existing) {
-    const service = new TenantApiKeyService(prisma as unknown as PrismaService);
-    const issued = await service.issueKey({
-      tenantId: result.tenantId,
-      label: options.label ?? `${shop} — custom app connection`,
-    });
-
-    apiKey = issued.rawKey;
-  }
+  const apiKey: string | null = result.issuedKey;
 
   console.log(
     JSON.stringify(
