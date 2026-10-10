@@ -43,7 +43,7 @@ const lowRiskProposal = {
   status: "PROPOSED",
   riskTier: "LOW",
   confidence: 0.95,
-  actionType: "RELEASE_ORDER_RESERVATION",
+  actionType: "ADD_ORDER_NOTE",
 };
 
 const enabledPolicy = {
@@ -68,6 +68,25 @@ describe("AiAutonomyService", () => {
         proposalId: "proposal-1",
         actorType: "SYSTEM",
       }),
+    );
+  });
+
+  it("never auto-executes RELEASE_ORDER_RESERVATION even under a matching, enabled policy (human-only)", async () => {
+    const { service, prisma, policyService, aiDecisionService, auditService } =
+      buildDeps();
+
+    prisma.aiDecisionProposal.findFirst.mockResolvedValue({
+      ...lowRiskProposal,
+      actionType: "RELEASE_ORDER_RESERVATION",
+    });
+    policyService.getPolicy.mockResolvedValue(enabledPolicy);
+    policyService.countRecentAutoExecutions.mockResolvedValue(0);
+
+    await service.maybeAutoExecute(baseInput);
+
+    expect(aiDecisionService.approve).not.toHaveBeenCalled();
+    expect(auditService.recordEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ action: "AI_AUTONOMY_HUMAN_ONLY_ACTION" }),
     );
   });
 

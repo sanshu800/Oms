@@ -26,6 +26,9 @@ const ONE_HOUR_MS = 60 * 60 * 1000;
  *  - Only LOW riskTier proposals are ever considered. A policy can
  *    lower the bar within LOW (via confidenceThreshold) but can never
  *    open the door to MEDIUM/HIGH auto-execution.
+ *  - RELEASE_ORDER_RESERVATION is human-only, always: no policy can
+ *    auto-execute it (safeguard — it changes inventory state in ways
+ *    that require explicit human authorization).
  *  - A policy must exist, be enabled, and be AUTO_BELOW_THRESHOLD.
  *    No policy row = no autonomy, by construction (the schema default
  *    is RECOMMEND_ONLY / disabled).
@@ -60,6 +63,27 @@ export class AiAutonomyService {
       }
 
       if (proposal.riskTier !== AiRiskTier.LOW) {
+        return;
+      }
+
+      // Hard rail: inventory-release actions require explicit human
+      // approval no matter how the policy is configured. Leave the
+      // proposal PROPOSED for human review.
+      if (proposal.actionType === "RELEASE_ORDER_RESERVATION") {
+        await this.auditService.recordEvent({
+          tenantId: input.tenantId,
+          storeId: input.storeId,
+          action: "AI_AUTONOMY_HUMAN_ONLY_ACTION",
+          actorType: AuditActorType.SYSTEM,
+          entityType: "AI_DECISION_PROPOSAL",
+          entityId: proposal.id,
+          metadata: {
+            actionType: proposal.actionType,
+            reason:
+              "RELEASE_ORDER_RESERVATION is human-only; auto-execution skipped regardless of policy",
+          },
+        });
+
         return;
       }
 
