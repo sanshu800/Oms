@@ -1299,7 +1299,7 @@ def page_subscription(d: Doc):
     y -= 18 + max(h1, h2) + 26
 
     # note panel
-    nh = 54
+    nh = 50
     rrect(c, ML, y - nh, CW, nh, r=8, fill=TEAL_L)
     para(d, "<font name='Inter-SemiBold' color='#0A6E63'>Changes after sign-off.</font> "
             "If priorities shift during or after implementation, Reygent AI will describe the "
