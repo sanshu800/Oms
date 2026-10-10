@@ -10,7 +10,7 @@ async function main() {
 
   // 1. Resolve the existing store
   const store = await prisma.storeConnection.findUnique({
-    where: { shopDomain: SHOP_DOMAIN },
+    where: { platform_externalStoreId: { platform: "SHOPIFY", externalStoreId: SHOP_DOMAIN } },
   });
 
   if (!store) {
@@ -21,7 +21,7 @@ async function main() {
   console.log({
     id: store.id,
     externalStoreId: store.externalStoreId,
-    shopDomain: store.shopDomain,
+    externalStoreId: store.externalStoreId,
   });
 
   // 2. Resolve the existing inventory item

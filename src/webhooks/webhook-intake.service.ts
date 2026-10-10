@@ -7,20 +7,25 @@ import {
 import { ConfigService } from "@nestjs/config";
 import { Prisma, WebhookStatus } from "@prisma/client";
 
-import { decryptSecret } from "../shopify/shopify-auth.crypto";
-import { verifyShopifyWebhook } from "./shopify-signature";
+import {
+  ChannelConnector,
+  DeliveryEnvelope,
+  ReadEnvelopeHeaders,
+} from "../connectors/connector.interface";
 import { PrismaService } from "../prisma/prisma.service";
 import { WebhookQueueService } from "../queue/webhook.queue";
 
-export type RecordShopifyDeliveryInput = {
-  shopDomain: string;
-  webhookId: string;
-  topic: string;
+export type RecordDeliveryInput = {
+  /** The channel connector that owns this delivery's auth and vocabulary. */
+  connector: ChannelConnector;
+  /** Delivery identity, already extracted and validated by the connector. */
+  envelope: DeliveryEnvelope;
+  /** Raw headers, passed through so the connector can verify the signature. */
+  headers: ReadEnvelopeHeaders;
   payload: Prisma.InputJsonValue;
   payloadSha256: string;
-  /** Raw request body — the HMAC is computed over these exact bytes. */
+  /** Raw request body — the signature is computed over these exact bytes. */
   rawBody: Buffer;
-  signature?: string | undefined;
 };
 
 export type RecordedDelivery = {
@@ -40,17 +45,14 @@ export type RecordedDelivery = {
 };
 
 /**
- * Durable intake for Shopify (and later, other channel) webhook
- * deliveries.
+ * Durable intake for channel webhook deliveries (Shopify today).
  *
  * Two production behaviours live here, deliberately:
  *
  * 1. **Verify against the right secret, then persist before acknowledging.**
- *    The store is resolved from the shop domain first, because the signing
- *    secret belongs to the app installed on *that* store: a deployment-wide
- *    secret only works when one app serves every store (OAuth). Custom apps
- *    each have their own secret, so the secret is read per store, falling
- *    back to `SHOPIFY_WEBHOOK_SECRET`. A delivery that fails verification is
+ *    The store is resolved from the delivery's store identity first, because
+ *    the signing secret belongs to the app installed on *that* store. The
+ *    channel connector performs the verification; a delivery that fails is
  *    rejected without being stored — an unauthenticated payload must not
  *    become replayable work. Once verified, the event row is written before
  *    queueing, so a delivery is never lost just because the queue is
@@ -74,43 +76,56 @@ export class WebhookIntakeService {
   ) {}
 
   /**
-   * Resolves the tenant from the shop domain and stores the delivery.
-   * This is inherently cross-tenant work: which tenant owns a delivery is
-   * exactly what the lookup discovers, so it runs before any tenant
-   * context exists.
+   * Resolves the tenant from the delivery's store identity and stores the
+   * delivery. This is inherently cross-tenant work: which tenant owns a
+   * delivery is exactly what the lookup discovers, so it runs before any
+   * tenant context exists.
    */
-  async recordShopifyDelivery(
-    input: RecordShopifyDeliveryInput,
+  async recordDelivery(
+    input: RecordDeliveryInput,
   ): Promise<RecordedDelivery> {
     return this.prisma.runAsSystem(async () => {
       const store = await this.prisma.storeConnection.findUnique({
-        where: { shopDomain: input.shopDomain },
+        where: {
+          platform_externalStoreId: {
+            platform: input.connector.platform,
+            externalStoreId: input.envelope.storeKey,
+          },
+        },
       });
 
-      // Unknown shop: there is no secret to verify against, so the payload
-      // cannot be authenticated and must not be stored or replayed.
+      // Unknown store: there is no secret to verify against, so the payload
+      // cannot be authenticated and must not be stored or replayable.
       if (!store) {
         this.logger.warn(
-          `Rejected delivery for unknown shop ${input.shopDomain} (topic ${input.topic})`,
+          `Rejected delivery for unknown shop ${input.envelope.storeKey} (topic ${input.envelope.topic})`,
         );
         throw new UnauthorizedException("Unknown Shopify shop");
       }
 
-      await this.verifySignature(store, input);
+      await input.connector.verifyDelivery({
+        rawBody: input.rawBody,
+        headers: input.headers,
+        store: {
+          id: store.id,
+          encryptedWebhookSecret: store.encryptedWebhookSecret,
+        },
+        envelope: input.envelope,
+      });
 
       const webhookEvent = await this.prisma.webhookEvent.upsert({
         where: {
-          storeId_shopifyEventId: {
+          storeId_externalEventId: {
             storeId: store.id,
-            shopifyEventId: input.webhookId,
+            externalEventId: input.envelope.externalEventId,
           },
         },
 
         create: {
           tenantId: store.tenantId,
           storeId: store.id,
-          topic: input.topic,
-          shopifyEventId: input.webhookId,
+          topic: input.envelope.topic,
+          externalEventId: input.envelope.externalEventId,
           payload: input.payload,
           payloadSha256: input.payloadSha256,
           status: WebhookStatus.RECEIVED,
@@ -150,69 +165,6 @@ export class WebhookIntakeService {
         resetForRetry,
       };
     });
-  }
-
-  /**
-   * Authenticates one delivery against the secret that belongs to the app
-   * installed on this store.
-   *
-   * Order matters and is intentional: a store-specific secret wins over the
-   * deployment-wide one, and a store-specific secret that does not match is
-   * *not* retried against the environment secret. Falling back after a
-   * mismatch would turn "someone rotated the secret in Shopify" into a
-   * confusing half-working state instead of a clear 401 in the logs plus the
-   * sentence below.
-   */
-  private async verifySignature(
-    store: { id: string; encryptedWebhookSecret: string | null },
-    input: RecordShopifyDeliveryInput,
-  ): Promise<void> {
-    let secret: string;
-    let source: "store" | "environment";
-
-    if (store.encryptedWebhookSecret) {
-      const encryptionKey = this.configService.get<string>("ENCRYPTION_KEY");
-
-      if (!encryptionKey) {
-        throw new Error(
-          "ENCRYPTION_KEY is not configured, so the store's webhook secret cannot be decrypted",
-        );
-      }
-
-      try {
-        secret = decryptSecret(store.encryptedWebhookSecret, encryptionKey);
-      } catch {
-        throw new Error(
-          `The stored webhook secret for store ${store.id} cannot be decrypted with the current ENCRYPTION_KEY. Reconnect the store (connect-shopify-store.ts) with the right key.`,
-        );
-      }
-
-      source = "store";
-    } else {
-      const environmentSecret =
-        this.configService.get<string>("SHOPIFY_WEBHOOK_SECRET");
-
-      if (!environmentSecret) {
-        throw new Error(
-          `SHOPIFY_WEBHOOK_SECRET is not configured and store ${store.id} has no stored webhook secret, so deliveries from ${input.shopDomain} cannot be verified`,
-        );
-      }
-
-      secret = environmentSecret;
-      source = "environment";
-    }
-
-    if (!verifyShopifyWebhook(input.rawBody, input.signature, secret)) {
-      this.logger.warn(
-        `Rejected ${input.topic} from ${input.shopDomain}: HMAC did not match the ${
-          source === "store"
-            ? "store-specific secret"
-            : "deployment-wide SHOPIFY_WEBHOOK_SECRET"
-        }. If the secret was rotated in Shopify, reconnect or update the store connection.`,
-      );
-
-      throw new UnauthorizedException("Invalid Shopify webhook signature");
-    }
   }
 
   async enqueueForProcessing(delivery: RecordedDelivery): Promise<void> {

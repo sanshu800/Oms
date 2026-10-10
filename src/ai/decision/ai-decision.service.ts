@@ -3,7 +3,9 @@ import {
   AiDecisionProposalStatus,
   AiOutcome,
   AuditActorType,
+  InventoryMovementType,
   InventoryReservationStatus,
+  OrderStatus,
 } from "@prisma/client";
 
 import { PrismaService } from "../../prisma/prisma.service";
@@ -163,8 +165,35 @@ export class AiDecisionService {
   }
 
   async approve(input: ApproveProposalInput) {
-    const proposal = await this.getProposalForDecision(input);
     const actorType = input.actorType ?? AuditActorType.USER;
+    const proposal = await this.getProposalForApproval(input);
+
+    // Idempotent replay (safeguard: retries and repeated execution must
+    // not re-execute): a proposal that already reached an execution
+    // outcome returns its recorded result. A different outcome requires
+    // a new investigation and a fresh proposal — renewed authorization.
+    if (
+      proposal.status === AiDecisionProposalStatus.EXECUTED ||
+      proposal.status === AiDecisionProposalStatus.EXECUTION_FAILED
+    ) {
+      const priorFeedback = await this.prisma.aiOutcomeFeedback.findFirst({
+        where: { proposalId: proposal.id },
+        orderBy: { createdAt: "desc" },
+      });
+
+      const executed = proposal.status === AiDecisionProposalStatus.EXECUTED;
+
+      return {
+        ...proposal,
+        executed,
+        verified: executed,
+        replayed: true,
+        error: executed
+          ? undefined
+          : ((priorFeedback?.observedResult as { executionError?: string } | null)
+              ?.executionError ?? "execution previously failed"),
+      };
+    }
 
     const requiredTargetType = REQUIRED_TARGET_ENTITY_TYPE[proposal.actionType];
 
@@ -210,7 +239,26 @@ export class AiDecisionService {
         },
       });
 
-      return { ...updated, executed: false, verified: false };
+      return {
+        ...updated,
+        executed: false,
+        verified: false,
+        replayed: false,
+        error: undefined,
+      };
+    }
+
+    // Hard safety rail (safeguard: RELEASE_ORDER_RESERVATION stays behind
+    // explicit human approval): a system/autonomy actor can never execute
+    // it, no matter what an AiAutonomyPolicy enables. The proposal stays
+    // PROPOSED so a human's later approval is the renewed authorization.
+    if (
+      proposal.actionType === "RELEASE_ORDER_RESERVATION" &&
+      actorType !== AuditActorType.USER
+    ) {
+      throw new Error(
+        "RELEASE_ORDER_RESERVATION requires explicit human approval; system/autonomy actors may not execute it",
+      );
     }
 
     // Known-safe, already-implemented action: reuse the exact same
@@ -267,7 +315,13 @@ export class AiDecisionService {
         metadata: { actionType: proposal.actionType, error: executionError },
       });
 
-      return { ...failed, executed: false, verified: false, error: executionError };
+      return {
+        ...failed,
+        executed: false,
+        verified: false,
+        replayed: false,
+        error: executionError,
+      };
     }
 
     // Independently re-verify the real state — never trust the
@@ -311,7 +365,13 @@ export class AiDecisionService {
       },
     });
 
-    return { ...updated, executed: true, verified };
+    return {
+      ...updated,
+      executed: true,
+      verified,
+      replayed: false,
+      error: undefined,
+    };
   }
 
   async reject(input: RejectProposalInput) {
@@ -357,6 +417,13 @@ export class AiDecisionService {
     input: ApproveProposalInput,
     proposal: { actionType: string; targetEntityId: string; targetEntityType: string; params: unknown },
   ): Promise<unknown> {
+    // Revalidate the target and its current state immediately before
+    // execution (safeguard): a proposal approved against a state that has
+    // since changed must fail safely here — inside the try/catch that
+    // records EXECUTION_FAILED — rather than act on reality it does not
+    // match. Renewed authorization means a new investigation/proposal.
+    await this.revalidateBeforeExecution(input, proposal);
+
     if (proposal.actionType === "RELEASE_ORDER_RESERVATION") {
       return this.inventoryService.releaseOrder({
         tenantId: input.tenantId,
@@ -397,6 +464,11 @@ export class AiDecisionService {
     proposal: { actionType: string; targetEntityId: string; targetEntityType: string; params: unknown },
   ): Promise<boolean> {
     if (proposal.actionType === "RELEASE_ORDER_RESERVATION") {
+      // Verify the EXACT intended effects, not merely "zero ACTIVE rows":
+      // every reservation of the order must sit RELEASED, and each one
+      // must have exactly one RELEASE movement recording the release with
+      // the same reservation id and quantity. A silent no-op that left the
+      // ledger untouched must never report as verified.
       const activeReservations = await this.prisma.inventoryReservation.count({
         where: {
           tenantId: input.tenantId,
@@ -406,7 +478,46 @@ export class AiDecisionService {
         },
       });
 
-      return activeReservations === 0;
+      if (activeReservations !== 0) {
+        return false;
+      }
+
+      const reservations = await this.prisma.inventoryReservation.findMany({
+        where: {
+          tenantId: input.tenantId,
+          storeId: input.storeId,
+          orderId: proposal.targetEntityId,
+        },
+        select: { id: true, quantity: true, status: true },
+      });
+
+      if (
+        reservations.length === 0 ||
+        reservations.some(
+          (reservation) =>
+            reservation.status !== InventoryReservationStatus.RELEASED,
+        )
+      ) {
+        return false;
+      }
+
+      const releaseMovements =
+        await this.prisma.inventoryMovement.findMany({
+          where: {
+            tenantId: input.tenantId,
+            orderId: proposal.targetEntityId,
+            type: InventoryMovementType.RELEASE,
+          },
+          select: { reservationId: true, quantity: true },
+        });
+
+      return reservations.every((reservation) =>
+        releaseMovements.some(
+          (movement) =>
+            movement.reservationId === reservation.id &&
+            movement.quantity === reservation.quantity,
+        ),
+      );
     }
 
     if (proposal.actionType === "ADD_ORDER_NOTE") {
@@ -447,6 +558,106 @@ export class AiDecisionService {
     }
 
     return proposal;
+  }
+
+  /**
+   * Like getProposalForDecision, but EXECUTED/EXECUTION_FAILED proposals
+   * are returned for idempotent replay instead of throwing — the caller
+   * must not re-execute them. All other decided states still refuse.
+   */
+  private async getProposalForApproval(
+    input: AiDecisionContext & { proposalId: string },
+  ) {
+    const proposal = await this.prisma.aiDecisionProposal.findFirst({
+      where: {
+        id: input.proposalId,
+        tenantId: input.tenantId,
+        storeId: input.storeId,
+      },
+    });
+
+    if (!proposal) {
+      throw new NotFoundException(
+        "AI decision proposal not found in this tenant/store",
+      );
+    }
+
+    if (
+      proposal.status === AiDecisionProposalStatus.EXECUTED ||
+      proposal.status === AiDecisionProposalStatus.EXECUTION_FAILED
+    ) {
+      return proposal;
+    }
+
+    if (proposal.status !== AiDecisionProposalStatus.PROPOSED) {
+      throw new Error(
+        `Proposal is not awaiting a decision (current status: ${proposal.status})`,
+      );
+    }
+
+    return proposal;
+  }
+
+  /**
+   * The last-moment safety check between authorization and mutation.
+   * Throws (surfacing as EXECUTION_FAILED with this message) whenever the
+   * world has moved since the proposal was written.
+   */
+  private async revalidateBeforeExecution(
+    input: ApproveProposalInput,
+    proposal: {
+      actionType: string;
+      targetEntityId: string;
+      targetEntityType: string;
+    },
+  ): Promise<void> {
+    const order = await this.prisma.order.findFirst({
+      where: {
+        id: proposal.targetEntityId,
+        tenantId: input.tenantId,
+        storeId: input.storeId,
+      },
+      select: { status: true },
+    });
+
+    if (!order) {
+      throw new Error(
+        "Pre-execution revalidation failed: target order no longer exists in this tenant/store; a new investigation is required",
+      );
+    }
+
+    if (proposal.actionType !== "RELEASE_ORDER_RESERVATION") {
+      return;
+    }
+
+    const advancedStatuses: OrderStatus[] = [
+      OrderStatus.FULFILLING,
+      OrderStatus.FULFILLED,
+      OrderStatus.CANCELLED,
+    ];
+
+    if (advancedStatuses.includes(order.status as OrderStatus)) {
+      throw new Error(
+        `Pre-execution revalidation failed: the order has advanced to ${order.status} since the proposal was raised; releasing its reservations would be unsafe. A new investigation is required`,
+      );
+    }
+
+    const reservations = await this.prisma.inventoryReservation.findMany({
+      where: { tenantId: input.tenantId, orderId: proposal.targetEntityId },
+      select: { status: true },
+    });
+
+    const advanced = reservations.filter(
+      (reservation) =>
+        reservation.status === InventoryReservationStatus.COMMITTED ||
+        reservation.status === InventoryReservationStatus.SHIPPED,
+    );
+
+    if (advanced.length > 0) {
+      throw new Error(
+        `Pre-execution revalidation failed: ${advanced.length} reservation(s) have advanced to COMMITTED/SHIPPED since the proposal was raised; releasing them would be unsafe. A new investigation is required`,
+      );
+    }
   }
 
   private async recordFeedback(

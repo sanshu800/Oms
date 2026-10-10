@@ -3,10 +3,13 @@ import { ConfigService } from "@nestjs/config";
 import { BullModule } from "@nestjs/bullmq";
 
 import { PrismaModule } from "../prisma/prisma.module";
+import { ConnectorsModule } from "../connectors/connectors.module";
 import { OrderModule } from "../oms/order/order.module";
 import { AuditModule } from "../oms/audit/audit.module";
 import { ExceptionModule } from "../oms/exception/exception.module";
 import { ResolutionModule } from "../oms/resolution/resolution.module";
+import { ShippingModule } from "../shipping/shipping.module";
+import { WmsModule } from "../wms/wms.module";
 
 import {
   WEBHOOK_QUEUE,
@@ -20,10 +23,15 @@ import { parseRedisConnectionOptions } from "../config/redis-connection";
 @Module({
   imports: [
     PrismaModule,
+    ConnectorsModule,
     OrderModule,
     AuditModule,
     ExceptionModule,
     ResolutionModule,
+    // The shared integration worker also processes WMS event jobs.
+    WmsModule,
+    // ...and shipping-provider event jobs.
+    ShippingModule,
 
     BullModule.forRootAsync({
       inject: [ConfigService],

@@ -7,9 +7,9 @@ async function main() {
   console.log("DATABASE:", process.env.DATABASE_URL);
 
   const raw = await p.$queryRaw`
-    SELECT id, "shopDomain", status
+    SELECT id, "externalStoreId", status
     FROM "StoreConnection"
-    WHERE "shopDomain" = 'test.myshopify.com'
+    WHERE "externalStoreId" = 'test.myshopify.com'
   `;
 
   console.log("RAW SQL:");
@@ -18,7 +18,7 @@ async function main() {
   const all = await p.storeConnection.findMany({
     select: {
       id: true,
-      shopDomain: true,
+      externalStoreId: true,
       status: true
     }
   });

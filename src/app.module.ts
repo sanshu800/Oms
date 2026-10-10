@@ -1,4 +1,4 @@
-﻿import { Module } from "@nestjs/common";
+import { Module } from "@nestjs/common";
 import { ConfigModule } from "@nestjs/config";
 
 import { HealthController } from "./health.controller";
@@ -15,6 +15,8 @@ import { InventoryModule } from "./oms/inventory/inventory.module";
 import { FulfillmentModule } from "./oms/fulfillment/fulfillment.module";
 import { RiskModule } from "./oms/risk/risk.module";
 import { ResolutionModule } from "./oms/resolution/resolution.module";
+import { ShippingModule } from "./shipping/shipping.module";
+import { WmsModule } from "./wms/wms.module";
 
 import { QueueModule } from "./queue/queue.module";
 
@@ -38,6 +40,8 @@ import { AiModule } from "./ai/ai.module";
     FulfillmentModule,
     RiskModule,
     ResolutionModule,
+    WmsModule,
+    ShippingModule,
 
     QueueModule,
 

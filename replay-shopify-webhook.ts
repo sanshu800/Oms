@@ -107,7 +107,12 @@ async function resolveSigningSecret(
       await tx.$executeRawUnsafe(`SELECT set_config('app.bypass_rls', 'on', true)`);
 
       return tx.storeConnection.findUnique({
-        where: { shopDomain },
+        where: {
+          platform_externalStoreId: {
+            platform: "SHOPIFY",
+            externalStoreId: shopDomain,
+          },
+        },
         select: { encryptedWebhookSecret: true },
       });
     });
@@ -162,7 +167,7 @@ async function main() {
 
         return tx.webhookEvent.findUnique({
           where: { id: options.fromEventId },
-          include: { store: { select: { shopDomain: true } } },
+          include: { store: { select: { externalStoreId: true } } },
         });
       });
 
@@ -172,8 +177,8 @@ async function main() {
 
       rawBody = JSON.stringify(event.payload, null, 2);
       topic = event.topic;
-      shopDomain = event.store.shopDomain;
-      webhookId = event.shopifyEventId;
+      shopDomain = event.store.externalStoreId;
+      webhookId = event.externalEventId;
     } finally {
       await prisma.$disconnect();
     }

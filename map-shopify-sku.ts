@@ -123,10 +123,17 @@ async function asOperator<T>(
 }
 
 async function resolveStore(shop: string) {
-  const store = await prisma.storeConnection.findUnique({
-    where: { shopDomain: shop },
-    select: { id: true, tenantId: true, status: true, shopDomain: true },
-  });
+  const store = await asOperator((tx) =>
+    tx.storeConnection.findUnique({
+      where: {
+        platform_externalStoreId: {
+          platform: "SHOPIFY",
+          externalStoreId: shop,
+        },
+      },
+      select: { id: true, tenantId: true, status: true, externalStoreId: true },
+    }),
+  );
 
   if (!store) {
     fail(
@@ -175,7 +182,7 @@ async function listMappings(shop: string) {
   console.log(
     JSON.stringify(
       {
-        shopDomain: store.shopDomain,
+        shopDomain: store.externalStoreId,
         storeStatus: store.status,
         itemCount: rows.length,
         mapped: rows.filter((row) => row.shopifyInventoryItemId).length,
@@ -267,7 +274,7 @@ async function run(options: Options) {
   if (options.remove) {
     if (!mapping) {
       console.log(
-        `SKU ${sku} has no ${store.shopDomain} mapping — nothing to remove.`,
+        `SKU ${sku} has no ${store.externalStoreId} mapping — nothing to remove.`,
       );
 
       return;
@@ -345,7 +352,7 @@ async function run(options: Options) {
       JSON.stringify(
         {
           dryRun: true,
-          shopDomain: store.shopDomain,
+          shopDomain: store.externalStoreId,
           sku,
           action: item ? "would update existing item" : "would create item",
           name: item?.name ?? options.name,
@@ -474,7 +481,7 @@ async function run(options: Options) {
   console.log(
     JSON.stringify(
       {
-        shopDomain: store.shopDomain,
+        shopDomain: store.externalStoreId,
         sku,
         inventoryItemId: result.inventoryItemId,
         item: result.created ? "created" : "existing (unchanged)",

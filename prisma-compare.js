@@ -6,7 +6,7 @@ const p = new PrismaClient();
 
 async function main() {
   const raw = await p.$queryRawUnsafe(`
-    SELECT id, "shopDomain", platform, status
+    SELECT id, "externalStoreId", platform, status
     FROM "StoreConnection"
   `);
 

@@ -1,6 +1,6 @@
 # TechMart OMS
 
-A Shopify-first, multi-tenant order and operations management platform. The repository contains a NestJS API, PostgreSQL/Prisma data layer, Redis/BullMQ workers, AI-assisted exception handling, and a Next.js dashboard with operational order and inventory views. Shopify create/update/cancel events feed the order lifecycle and inventory reservation ledger.
+A Shopify-first, multi-tenant order and operations management platform. The repository contains a NestJS API, PostgreSQL/Prisma data layer, Redis/BullMQ workers, and AI-assisted exception handling. Shopify create/update/cancel events feed the order lifecycle and inventory reservation ledger. (The operator dashboard is deliberately not in this repository yet — it will be rebuilt once the backend is production-ready.)
 
 ## Stack
 
@@ -41,24 +41,15 @@ Requirements: Node.js 22–24, npm, and Docker Compose.
 
    The API listens on `http://localhost:4000`; `GET /health` is the basic health check.
 
-5. Optionally run the dashboard in another terminal:
-
-   ```sh
-   cd dashboard
-   npm ci
-   API_SERVER_URL=http://localhost:4000 npm run dev
-   ```
-
 ### Environment notes
 
 - `DATABASE_URL` is for schema migrations and must use the database-owner account.
 - `APP_DATABASE_URL` is the API's runtime connection and should use the restricted, non-superuser `techmart_app` account. This is required for PostgreSQL row-level security (RLS) to protect tenant data. The local example contains the credentials created by Docker Compose.
 - `REDIS_URL` is the connection used by BullMQ. It accepts `redis://` and `rediss://` URLs, including credentials and a database index.
 - Shopify credentials and `GROQ_API_KEY` may be blank in development/test so the API and unit tests can start without external accounts. Shopify OAuth/webhooks and AI investigations need their respective credentials. Production validation requires these integration credentials and `APP_DATABASE_URL`.
-- `APP_URL` is the externally reachable **API** origin; Shopify subscriptions are registered against `<APP_URL>/webhooks/shopify`. It must be stable per environment — see "Hosting and Shopify connectivity" below. It is not the dashboard's address: the dashboard is host-agnostic and needs no URL variable.
+- `APP_URL` is the externally reachable **API** origin; Shopify subscriptions are registered against `<APP_URL>/webhooks/shopify`. It must be stable per environment — see "Hosting and Shopify connectivity" below.
 - `APP_DOMAIN` is the registrable domain `APP_URL` lives under (for example `reygent.com`). It is required in production, enforced for any environment where it is set, and used by the webhook registration script to recognise this app's subscriptions on a store.
 - `WEBHOOK_ENQUEUE_TIMEOUT_MS` bounds how long the API waits for the queue while accepting a delivery (default 4000ms, under Shopify's 5s limit). The delivery is stored first; if queueing fails it is marked FAILED with the reason and the API answers 503 so Shopify retries.
-- The dashboard proxies browser calls through same-origin `/api/*` routes. Set `API_SERVER_URL` in `dashboard/.env.local` or the dashboard process environment to the API origin; do not point browser code directly at a localhost URL.
 
 ### Hosting and Shopify connectivity
 
@@ -69,10 +60,10 @@ Shopify pushes webhooks to a URI that is stored **on Shopify's side**, per store
 
 Environment plan (subdomains under `APP_DOMAIN`):
 
-| Environment | You browse | `APP_URL` (API) | Shopify store | How webhooks arrive |
+| Environment | Operator UI (planned) | `APP_URL` (API) | Shopify store | How webhooks arrive |
 | --- | --- | --- | --- | --- |
-| Local development | `http://localhost:3000` | `http://localhost:4000` | dev store only | replayed locally (no tunnel needed) |
-| Development on `reygent.com` | `oms.reygent.com` | `https://oms.reygent.com` (same host; the dashboard forwards `/webhooks/*`) | dedicated dev app + dev store | tunnel → dashboard → API |
+| Local development | — | `http://localhost:4000` | dev store only | replayed locally (no tunnel needed) |
+| Development on `reygent.com` | — | `https://oms.reygent.com` (tunnel host for the API) | dedicated dev app + dev store | tunnel → API |
 | Staging | `oms-staging.reygent.com` | `https://api-staging.reygent.com` | staging store | real deployment |
 | Production | `app.reygent.com` | `https://api.reygent.com` | merchant stores | real deployment |
 
@@ -189,4 +180,4 @@ The API exposes tenant/store identity, Shopify install and webhook endpoints, ex
 - `GET /oms/inventory?storeId=...` supports SKU/name search and pagination; `GET /oms/inventory/:sku?storeId=...` returns balances by location and store-specific external references.
 - Every `/oms/orders/*` and `/oms/inventory/*` request requires `Authorization: Bearer <tenant API key>` and is restricted using the authenticated tenant plus the requested store.
 
-Shopify `orders/create`, `orders/updated`, and `orders/cancelled` events are idempotently synced. Line items are joined to the inventory ledger by **SKU**; a SKU with no catalogue row is not guessed at — the order is stored as `FAILED` with a HIGH `ORDER_OPERATIONAL_RISK` exception, and `map-shopify-sku.ts` is the operator command that closes the gap. `shopify-register-orders-webhook.ts` registers all three topics at the configured webhook URI. Pre-fulfillment line changes release and reconcile active reservations; cancellation releases active reservations. Committed/shipped stock is not automatically restored when a later cancellation arrives. The dashboard provides order lifecycle/detail and inventory/location views alongside exceptions, proposals, autonomy, and settings.
+Shopify `orders/create`, `orders/updated`, and `orders/cancelled` events are idempotently synced. Line items are joined to the inventory ledger by **SKU**; a SKU with no catalogue row is not guessed at — the order is stored as `FAILED` with a HIGH `ORDER_OPERATIONAL_RISK` exception, and `map-shopify-sku.ts` is the operator command that closes the gap. `shopify-register-orders-webhook.ts` registers all three topics at the configured webhook URI. Pre-fulfillment line changes release and reconcile active reservations; cancellation releases active reservations. Committed/shipped stock is not automatically restored when a later cancellation arrives.

@@ -1,5 +1,5 @@
 diff --git a/node_modules/@prisma/adapter-pg/dist/index.js b/node_modules/@prisma/adapter-pg/dist/index.js
-index 6baabe2..1446a75 100644
+index 6baabe2..3342627 100644
 --- a/node_modules/@prisma/adapter-pg/dist/index.js
 +++ b/node_modules/@prisma/adapter-pg/dist/index.js
 @@ -232,6 +232,11 @@ function fieldToColumnType(fieldTypeId) {
@@ -14,8 +14,94 @@ index 6baabe2..1446a75 100644
      case ScalarColumnType.BPCHAR:
      case ScalarColumnType.TEXT:
      case ScalarColumnType.VARCHAR:
+@@ -746,7 +751,84 @@ var PrismaPgAdapter = class extends PgQueryable {
+     }
+   }
+   async executeScript(script) {
+-    const statements = script.split(";").map((stmt) => stmt.trim()).filter((stmt) => stmt.length > 0);
++    const statements = [];
++    {
++      let current = "";
++      let i = 0;
++      while (i < script.length) {
++        const ch = script[i];
++        const next = i + 1 < script.length ? script[i + 1] : "";
++        if (ch === "-" && next === "-") {
++          while (i < script.length && script[i] !== "\n") {
++            current += script[i];
++            i++;
++          }
++          continue;
++        }
++        if (ch === "/" && next === "*") {
++          current += script[i];
++          i++;
++          current += script[i];
++          i++;
++          while (i + 1 < script.length && !(script[i] === "*" && script[i + 1] === "/")) {
++            current += script[i];
++            i++;
++          }
++          if (i + 1 < script.length) {
++            current += script[i];
++            i++;
++            current += script[i];
++            i++;
++          }
++          continue;
++        }
++        if (ch === "'" || ch === "\"") {
++          const quote = ch;
++          current += ch;
++          i++;
++          while (i < script.length) {
++            current += script[i];
++            if (script[i] === quote) {
++              if (i + 1 < script.length && script[i + 1] === quote) {
++                current += script[i + 1];
++                i += 2;
++                continue;
++              }
++              i++;
++              break;
++            }
++            i++;
++          }
++          continue;
++        }
++        if (ch === "$") {
++          const tagMatch = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(script.slice(i));
++          if (tagMatch) {
++            const tag = tagMatch[0];
++            const end = script.indexOf(tag, i + tag.length);
++            const stop = end === -1 ? script.length : end + tag.length;
++            current += script.slice(i, stop);
++            i = stop;
++            continue;
++          }
++        }
++        if (ch === ";") {
++          const trimmed = current.trim();
++          if (trimmed.length > 0) {
++            statements.push(trimmed);
++          }
++          current = "";
++          i++;
++          continue;
++        }
++        current += ch;
++        i++;
++      }
++      const tail = current.trim();
++      if (tail.length > 0) {
++        statements.push(tail);
++      }
++    }
+     for (const stmt of statements) {
+       try {
+         await this.client.query(stmt);
 diff --git a/node_modules/@prisma/adapter-pg/dist/index.mjs b/node_modules/@prisma/adapter-pg/dist/index.mjs
-index f2be06d..fbb4203 100644
+index f2be06d..e310c2e 100644
 --- a/node_modules/@prisma/adapter-pg/dist/index.mjs
 +++ b/node_modules/@prisma/adapter-pg/dist/index.mjs
 @@ -196,6 +196,11 @@ function fieldToColumnType(fieldTypeId) {
@@ -30,3 +116,89 @@ index f2be06d..fbb4203 100644
      case ScalarColumnType.BPCHAR:
      case ScalarColumnType.TEXT:
      case ScalarColumnType.VARCHAR:
+@@ -710,7 +715,84 @@ var PrismaPgAdapter = class extends PgQueryable {
+     }
+   }
+   async executeScript(script) {
+-    const statements = script.split(";").map((stmt) => stmt.trim()).filter((stmt) => stmt.length > 0);
++    const statements = [];
++    {
++      let current = "";
++      let i = 0;
++      while (i < script.length) {
++        const ch = script[i];
++        const next = i + 1 < script.length ? script[i + 1] : "";
++        if (ch === "-" && next === "-") {
++          while (i < script.length && script[i] !== "\n") {
++            current += script[i];
++            i++;
++          }
++          continue;
++        }
++        if (ch === "/" && next === "*") {
++          current += script[i];
++          i++;
++          current += script[i];
++          i++;
++          while (i + 1 < script.length && !(script[i] === "*" && script[i + 1] === "/")) {
++            current += script[i];
++            i++;
++          }
++          if (i + 1 < script.length) {
++            current += script[i];
++            i++;
++            current += script[i];
++            i++;
++          }
++          continue;
++        }
++        if (ch === "'" || ch === "\"") {
++          const quote = ch;
++          current += ch;
++          i++;
++          while (i < script.length) {
++            current += script[i];
++            if (script[i] === quote) {
++              if (i + 1 < script.length && script[i + 1] === quote) {
++                current += script[i + 1];
++                i += 2;
++                continue;
++              }
++              i++;
++              break;
++            }
++            i++;
++          }
++          continue;
++        }
++        if (ch === "$") {
++          const tagMatch = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(script.slice(i));
++          if (tagMatch) {
++            const tag = tagMatch[0];
++            const end = script.indexOf(tag, i + tag.length);
++            const stop = end === -1 ? script.length : end + tag.length;
++            current += script.slice(i, stop);
++            i = stop;
++            continue;
++          }
++        }
++        if (ch === ";") {
++          const trimmed = current.trim();
++          if (trimmed.length > 0) {
++            statements.push(trimmed);
++          }
++          current = "";
++          i++;
++          continue;
++        }
++        current += ch;
++        i++;
++      }
++      const tail = current.trim();
++      if (tail.length > 0) {
++        statements.push(tail);
++      }
++    }
+     for (const stmt of statements) {
+       try {
+         await this.client.query(stmt);

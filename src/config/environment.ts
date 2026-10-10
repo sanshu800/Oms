@@ -117,6 +117,29 @@ const schema = z
       .min(1)
       .default("openai/gpt-oss-120b"),
 
+    // Optional Jev (TypeSafe AI) DecisionModel settings. Advisory-only
+    // capability: no key is required for local development or tests, and
+    // nothing calls the provider unless DECISION_MODEL_ENGINE=jev is set
+    // AND a key is present. See src/ai/decision-model/.
+    DECISION_MODEL_ENGINE: z.enum(["scripted", "jev"]).default("scripted"),
+
+    JEV_API_KEY: optionalStringFromBlank,
+
+    JEV_API_URL: optionalStringFromBlank,
+
+    JEV_MODEL: z
+      .string()
+      .min(1)
+      .default("jev-latest"),
+
+    JEV_TIMEOUT_MS: z
+      .coerce
+      .number()
+      .int()
+      .min(100)
+      .max(5000)
+      .default(2000),
+
     AI_INVESTIGATION_MAX_TOOL_CALLS: z
       .coerce
       .number()

@@ -8,6 +8,7 @@ import {
 
 vi.mock('@prisma/client', () => import('../../../test-utils/prisma-client.mock'));
 
+import { ShopifyConnector } from '../../connectors/shopify/shopify.connector';
 import { OrderService } from './order.service';
 
 describe('OrderService', () => {
@@ -54,6 +55,23 @@ describe('OrderService', () => {
     );
   });
 
+  // The payloads below are Shopify webhook payloads; since the connector
+  // refactor they enter OrderService as NormalizedOrder via
+  // ShopifyConnector.normalizeOrder (assertions unchanged).
+  async function ingest(input: { payload: unknown; topic?: string }) {
+    const connector = new ShopifyConnector({} as never, {} as never);
+    const order = connector.normalizeOrder({
+      topic: input.topic ?? 'orders/create',
+      payload: input.payload,
+    });
+
+    return service.upsertFromChannel({
+      tenantId: 'tenant-001',
+      storeId: 'store-001',
+      order,
+    });
+  }
+
   it('should be defined', () => {
     expect(service).toBeDefined();
   });
@@ -86,9 +104,7 @@ describe('OrderService', () => {
     });
 
     const result =
-      await service.upsertFromShopify({
-        tenantId: 'tenant-001',
-        storeId: 'store-001',
+      await ingest({
         payload: {
           id: 123456789,
           name: '#1001',
@@ -152,9 +168,7 @@ describe('OrderService', () => {
     });
 
     await expect(
-      service.upsertFromShopify({
-        tenantId: 'tenant-001',
-        storeId: 'store-001',
+      ingest({
         payload: {
           id: 123456790,
           name: '#1002',
@@ -231,9 +245,7 @@ describe('OrderService', () => {
       items: [],
     });
 
-    const result = await service.upsertFromShopify({
-      tenantId: 'tenant-001',
-      storeId: 'store-001',
+    const result = await ingest({
       topic: 'orders/updated',
       payload: {
         id: 123456791,
@@ -296,9 +308,7 @@ describe('OrderService', () => {
       items: [],
     });
 
-    const result = await service.upsertFromShopify({
-      tenantId: 'tenant-001',
-      storeId: 'store-001',
+    const result = await ingest({
       topic: 'orders/cancelled',
       payload: {
         id: 123456792,
@@ -352,9 +362,7 @@ describe('OrderService', () => {
       items: [],
     });
 
-    await service.upsertFromShopify({
-      tenantId: 'tenant-001',
-      storeId: 'store-001',
+    await ingest({
       topic: 'orders/updated',
       payload: {
         id: 123456793,
@@ -424,9 +432,7 @@ describe('OrderService', () => {
       ],
     });
 
-    await service.upsertFromShopify({
-      tenantId: 'tenant-001',
-      storeId: 'store-001',
+    await ingest({
       topic: 'orders/updated',
       payload: {
         id: 123456794,
@@ -471,9 +477,7 @@ describe('OrderService', () => {
       items: [],
     });
 
-    await service.upsertFromShopify({
-      tenantId: 'tenant-001',
-      storeId: 'store-001',
+    await ingest({
       topic: 'orders/updated',
       payload: {
         id: 123456795,

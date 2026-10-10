@@ -7,6 +7,7 @@ import {
 
 import { PrismaService } from '../../prisma/prisma.service';
 import { tenantContextStorage } from '../../prisma/tenant-context';
+import { resolveCanonicalInventoryItem } from './canonical-mapping';
 
 @Injectable()
 export class AllocationService {
@@ -33,6 +34,20 @@ export class AllocationService {
         throw new Error('Order not found for inventory allocation');
       }
 
+      const store = await tx.storeConnection.findFirst({
+        where: {
+          id: input.storeId,
+          tenantId: input.tenantId,
+        },
+        select: {
+          platform: true,
+        },
+      });
+
+      if (!store) {
+        throw new Error('Store not found for inventory allocation');
+      }
+
       const invalidItem = order.items.find(
         (item) => !Number.isInteger(item.quantity) || item.quantity < 0,
       );
@@ -57,13 +72,15 @@ export class AllocationService {
 
       for (const orderItem of reservableItems) {
 
-        const inventoryItem = await tx.inventoryItem.findUnique({
-          where: {
-            tenantId_sku: {
-              tenantId: input.tenantId,
-              sku: orderItem.sku.trim(),
-            },
-          },
+        // Canonical inventory resolution goes through the mapping
+        // boundary (locked decision 4): external-reference primary,
+        // SKU fallback under the explicitly defined rule.
+        const inventoryItem = await resolveCanonicalInventoryItem(tx, {
+          tenantId: input.tenantId,
+          storeId: input.storeId,
+          platform: store.platform,
+          externalItemRef: orderItem.externalItemRef,
+          sku: orderItem.sku,
         });
 
         if (!inventoryItem || !inventoryItem.active) {

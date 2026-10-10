@@ -1,5 +1,6 @@
 import { Module } from "@nestjs/common";
 
+import { ConnectorsModule } from "../connectors/connectors.module";
 import { PrismaModule } from "../prisma/prisma.module";
 import { QueueModule } from "../queue/queue.module";
 
@@ -13,7 +14,7 @@ import { WebhookIntakeService } from "./webhook-intake.service";
  * receivers can be added here without touching Shopify auth.
  */
 @Module({
-  imports: [PrismaModule, QueueModule],
+  imports: [PrismaModule, QueueModule, ConnectorsModule],
   controllers: [ShopifyController],
   providers: [WebhookIntakeService],
   exports: [WebhookIntakeService],

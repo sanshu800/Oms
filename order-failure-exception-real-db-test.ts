@@ -1,7 +1,9 @@
-﻿import { NestFactory } from "@nestjs/core";
+import { NestFactory } from "@nestjs/core";
 import { AppModule } from "./src/app.module";
 import { PrismaService } from "./src/prisma/prisma.service";
+import { tenantContextStorage } from "./src/prisma/tenant-context";
 import { OrderService } from "./src/oms/order/order.service";
+import { ShopifyConnector } from "./src/connectors/shopify/shopify.connector";
 
 async function main() {
   const app = await NestFactory.createApplicationContext(AppModule);
@@ -12,12 +14,15 @@ async function main() {
 
     const store = await prisma.storeConnection.findUnique({
       where: {
-        shopDomain: "techmart-lab.myshopify.com",
+        platform_externalStoreId: {
+          platform: "SHOPIFY",
+          externalStoreId: "techmart-lab.myshopify.com",
+        },
       },
       select: {
         id: true,
         tenantId: true,
-        shopDomain: true,
+        externalStoreId: true,
       },
     });
 
@@ -55,7 +60,7 @@ async function main() {
     const orderNumber = `#REAL-FAIL-${Date.now()}`;
 
     console.log(JSON.stringify({
-      store: store.shopDomain,
+      store: store.externalStoreId,
       tenantId: store.tenantId,
       storeId: store.id,
       sku: inventoryItem.sku,
@@ -65,13 +70,16 @@ async function main() {
       orderNumber,
     }, null, 2));
 
-    let orderId: string | null = null;
+    let _orderId: string | null = null;
 
     try {
-      await orderService.upsertFromShopify({
+      const connector = new ShopifyConnector({} as never, {} as never);
+      await orderService.upsertFromChannel({
         tenantId: store.tenantId,
         storeId: store.id,
-        payload: {
+        order: connector.normalizeOrder({
+          topic: "orders/create",
+          payload: {
           id: externalOrderId,
           name: orderNumber,
           financial_status: "paid",
@@ -88,7 +96,8 @@ async function main() {
               price: "629.95",
             },
           ],
-        },
+          },
+        }),
       });
 
       throw new Error(
@@ -126,7 +135,7 @@ async function main() {
       throw new Error("TEST FAILED: OMS order was not persisted.");
     }
 
-    orderId = order.id;
+    _orderId = order.id;
 
     const failedItem = order.items[0];
 
@@ -239,7 +248,10 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+// Runs as operator (RLS bypass): this script reads across the seeded lab
+// store's rows and is not scoped to one tenant session. Service calls
+// inside set their own tenant context per operation.
+tenantContextStorage.run({ bypass: true }, () => main()).catch((error) => {
   console.error(
     "REAL ORDER FAILURE -> EXCEPTION VERIFICATION FAILED",
   );

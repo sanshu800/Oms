@@ -18,7 +18,7 @@ async function main() {
 
   const shopDomain = "ui-demo-shop.myshopify.com";
 
-  await prisma.runAsSystem(() => prisma.storeConnection.deleteMany({ where: { shopDomain } }));
+  await prisma.runAsSystem(() => prisma.storeConnection.deleteMany({ where: { externalStoreId: shopDomain } }));
 
   const install = await shopifyAuth.activateStore(shopDomain, "fake-token", ["read_orders"]);
 

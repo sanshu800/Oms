@@ -397,6 +397,56 @@ export class FulfillmentService {
   }
 
   // ============================================================
+  // FAIL
+  // ============================================================
+
+  /**
+   * The warehouse reports the request cannot be executed. Same inventory
+   * release semantics as cancel (nothing has shipped at this point), a
+   * distinct terminal status so failure stays auditable.
+   */
+  async fail(input: CancelFulfillmentInput) {
+    const fulfillment = await this.getById(input);
+
+    if (fulfillment.status === FulfillmentStatus.FAILED) {
+      return fulfillment;
+    }
+
+    if (
+      fulfillment.status !== FulfillmentStatus.READY &&
+      fulfillment.status !== FulfillmentStatus.IN_PROGRESS
+    ) {
+      throw new Error(
+        `Cannot fail fulfillment from status ${fulfillment.status}`,
+      );
+    }
+
+    /* InventoryService owns reservation release (same as cancel). */
+    await this.inventoryService.releaseOrder({
+      tenantId: input.tenantId,
+      storeId: input.storeId,
+      orderId: fulfillment.orderId,
+    });
+
+    return this.prisma.fulfillment.update({
+      where: {
+        id: fulfillment.id,
+      },
+      data: {
+        status: FulfillmentStatus.FAILED,
+      },
+      include: {
+        items: true,
+        shipments: {
+          include: {
+            items: true,
+          },
+        },
+      },
+    });
+  }
+
+  // ============================================================
   // CREATE SHIPMENT
   // ============================================================
 
@@ -712,7 +762,14 @@ export class FulfillmentService {
     return result._sum.quantity ?? 0;
   }
 
-  private async getShippedQuantityByFulfillmentItem(fulfillmentId: string) {
+  /**
+   * Shipped quantity per fulfillment item — the single source of truth
+   * for how much of a fulfillment has actually left the warehouse
+   * (cancelled shipments do not count). Public so the WMS integration
+   * can SET its request-line bookkeeping from the same numbers instead
+   * of keeping a second, divergent count.
+   */
+  async getShippedQuantityByFulfillmentItem(fulfillmentId: string) {
     const items = await this.prisma.shipmentItem.findMany({
       where: {
         fulfillmentItem: {

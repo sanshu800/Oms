@@ -15,11 +15,16 @@ import { createHash } from "crypto";
 
 import { Prisma } from "@prisma/client";
 
+import { ReadEnvelopeHeaders } from "../connectors/connector.interface";
+import { ShopifyConnector } from "../connectors/shopify/shopify.connector";
 import { WebhookIntakeService } from "./webhook-intake.service";
 
 @Controller("webhooks")
 export class ShopifyController {
-  constructor(private readonly intake: WebhookIntakeService) {}
+  constructor(
+    private readonly intake: WebhookIntakeService,
+    private readonly connector: ShopifyConnector,
+  ) {}
 
   /**
    * Answer a browser or uptime probe that opens the webhook URI by hand.
@@ -45,10 +50,7 @@ export class ShopifyController {
   @HttpCode(202)
   async handleShopifyWebhook(
     @Req() req: RawBodyRequest<FastifyRequest>,
-    @Headers("x-shopify-hmac-sha256") signature?: string,
-    @Headers("x-shopify-shop-domain") shopDomain?: string,
-    @Headers("x-shopify-webhook-id") webhookId?: string,
-    @Headers("x-shopify-topic") topic?: string,
+    @Headers() headers: ReadEnvelopeHeaders,
   ) {
     // Malformed deliveries are a client error, not an outage: a 400 keeps
     // monitoring honest and stops Shopify from treating garbage as retryable.
@@ -56,11 +58,11 @@ export class ShopifyController {
       throw new BadRequestException("Raw request body is unavailable");
     }
 
-    if (!shopDomain || !webhookId || !topic) {
-      throw new BadRequestException(
-        "Required Shopify webhook headers are missing",
-      );
-    }
+    // The connector extracts and validates the required Shopify headers.
+    // This happens before JSON parsing on purpose: a delivery with both
+    // missing headers and a bad body must get the header error, exactly as
+    // before the connector boundary existed.
+    const envelope = this.connector.readEnvelope(headers);
 
     const rawBody = req.rawBody;
 
@@ -75,19 +77,17 @@ export class ShopifyController {
     }
 
     // Authenticate, store (durable), then queue under a deadline. The
-    // signature is checked inside the intake because the signing secret is
-    // per store: a custom app has its own secret, and a store without one
-    // falls back to the deployment-wide SHOPIFY_WEBHOOK_SECRET. A queue
-    // failure raises 503 so Shopify retries with backoff instead of dropping
-    // the event — repeat failures are what get a subscription deleted.
-    const delivery = await this.intake.recordShopifyDelivery({
-      shopDomain: String(shopDomain),
-      webhookId: String(webhookId),
-      topic: String(topic),
+    // signature is verified inside the connector against the secret that
+    // belongs to this store; a queue failure raises 503 so Shopify retries
+    // with backoff instead of dropping the event — repeat failures are what
+    // get a subscription deleted.
+    const delivery = await this.intake.recordDelivery({
+      connector: this.connector,
+      envelope,
+      headers,
       payload,
       payloadSha256,
       rawBody,
-      signature,
     });
 
     await this.intake.enqueueForProcessing(delivery);
