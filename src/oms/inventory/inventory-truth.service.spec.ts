@@ -1,9 +1,9 @@
-﻿import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { InventoryTruthService } from './inventory-truth.service';
 
 describe('InventoryTruthService', () => {
-  function createService(balances: unknown[]) {
+  function createService(balances: unknown[], reservations: unknown[] = []) {
     const prisma = {
       inventoryItem: {
         findUnique: vi.fn().mockResolvedValue({
@@ -12,6 +12,9 @@ describe('InventoryTruthService', () => {
           name: 'The Multi-managed Snowboard',
           balances,
         }),
+      },
+      inventoryReservation: {
+        findMany: vi.fn().mockResolvedValue(reservations),
       },
     };
 
@@ -169,6 +172,77 @@ describe('InventoryTruthService', () => {
     });
 
     expect(result).toBeNull();
+  });
+
+  // ---- reservation-holder evidence (Phase 1C) ----
+
+  const singleBalance = [
+    {
+      inventoryItemId: 'inventory-1',
+      locationId: 'location-1',
+      availableQty: 5,
+      reservedQty: 5,
+      committedQty: 2,
+      updatedAt: new Date(),
+      location: { id: 'location-1', code: 'SHOP', name: 'Shop location' },
+    },
+  ];
+
+  it('returns stock-holding reservation rows mapped to orderId/quantity/status', async () => {
+    const { service, prisma } = createService(singleBalance, [
+      { orderId: 'order-a', quantity: 5, status: 'ACTIVE' },
+      { orderId: 'order-b', quantity: 2, status: 'COMMITTED' },
+    ]);
+
+    const result = await service.getSkuTruth({
+      tenantId: 'tenant-1',
+      sku: 'sku-managed-1',
+    });
+
+    expect(result?.reservations).toEqual([
+      { orderId: 'order-a', quantity: 5, status: 'ACTIVE' },
+      { orderId: 'order-b', quantity: 2, status: 'COMMITTED' },
+    ]);
+
+    // The query asks for exactly the stock-holding statuses (ACTIVE,
+    // COMMITTED) of THIS tenant's item — terminal rows (RELEASED, SHIPPED)
+    // are never requested.
+    const where = (prisma.inventoryReservation.findMany as any).mock
+      .calls[0][0].where;
+    expect(where.tenantId).toBe('tenant-1');
+    expect(where.inventoryItemId).toBe('inventory-1');
+    expect(where.status).toEqual({ in: ['ACTIVE', 'COMMITTED'] });
+  });
+
+  it('scopes reservation evidence to the requested store when storeId is given', async () => {
+    const { service, prisma } = createService(singleBalance, [
+      { orderId: 'order-a', quantity: 5, status: 'ACTIVE' },
+    ]);
+
+    await service.getSkuTruth({
+      tenantId: 'tenant-1',
+      sku: 'sku-managed-1',
+      storeId: 'store-1',
+    });
+
+    const where = (prisma.inventoryReservation.findMany as any).mock
+      .calls[0][0].where;
+    expect(where.storeId).toBe('store-1');
+  });
+
+  it('does not filter by store when the caller does not request store scope', async () => {
+    const { service, prisma } = createService(singleBalance, [
+      { orderId: 'order-a', quantity: 5, status: 'ACTIVE' },
+    ]);
+
+    await service.getSkuTruth({
+      tenantId: 'tenant-1',
+      sku: 'sku-managed-1',
+    });
+
+    const where = (prisma.inventoryReservation.findMany as any).mock
+      .calls[0][0].where;
+    expect('storeId' in where).toBe(false);
   });
 });
 

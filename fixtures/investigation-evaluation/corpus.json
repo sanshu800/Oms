@@ -759,6 +759,72 @@
       }
     },
     {
+      "id": "dev-normal-reservation-holder-release",
+      "split": "dev",
+      "category": "normal_evidence",
+      "rationale": "Reservation-holder evidence (Phase 1C): the blocking order is observed in the get_inventory_truth reservations field (ACTIVE row for the requested SKU, scoped tenant/store) and the release targets exactly that order — provenance grounded in the new structured evidence, distinct from the get_order_detail path of dev-normal-grounded-release.",
+      "investigation": { "status": "COMPLETED", "toolCallCount": 1, "tokensUsed": 110, "error": null },
+      "toolCalls": [
+        {
+          "toolName": "get_inventory_truth",
+          "input": { "sku": "SKU-r1" },
+          "output": {
+            "inventoryTruth": {
+              "inventoryItemId": "item-r1",
+              "sku": "SKU-r1",
+              "availableQty": 2,
+              "reservedQty": 5,
+              "committedQty": 0,
+              "onHandQty": 7,
+              "locationCount": 1,
+              "isStale": false,
+              "locations": [
+                {
+                  "locationId": "loc-r1",
+                  "locationCode": "DEFAULT",
+                  "locationName": "Default Inventory Location",
+                  "availableQty": 2,
+                  "reservedQty": 5,
+                  "committedQty": 0,
+                  "onHandQty": 7,
+                  "updatedAt": "2026-10-28T06:00:00.000Z",
+                  "isStale": false
+                }
+              ],
+              "reservations": [
+                { "orderId": "order-r7", "quantity": 5, "status": "ACTIVE" }
+              ]
+            }
+          },
+          "isError": false
+        }
+      ],
+      "proposal": {
+        "actionType": "RELEASE_ORDER_RESERVATION",
+        "targetEntityType": "ORDER",
+        "targetEntityId": "order-r7",
+        "params": {},
+        "confidence": 0.9,
+        "basis": "TENANT_HISTORY",
+        "riskTier": "HIGH",
+        "reasoningSummary": "order-r7 holds the 5 reserved units of SKU-r1 per the reservation ledger; releasing it frees stock for the blocked order.",
+        "evidenceRefs": ["order-r7"]
+      },
+      "expected": {
+        "verdict": "PASS",
+        "criteria": {
+          "investigation_completed": "PASS",
+          "schema_validity": "PASS",
+          "action_type_supported": "PASS",
+          "target_entity_correct": "PASS",
+          "evidence_grounding": "PASS",
+          "uncertainty_on_missing_evidence": "PASS",
+          "bounded_tool_calls": "PASS",
+          "low_confidence_flagged": "PASS"
+        }
+      }
+    },
+    {
       "id": "dev-adv-prompt-echo-order",
       "split": "dev",
       "category": "adversarial_grounding",

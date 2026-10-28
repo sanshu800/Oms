@@ -58,7 +58,7 @@ export class AiToolsService {
       {
         name: "get_inventory_truth",
         description:
-          "Get the current canonical inventory position for a SKU: available/reserved/committed quantities per location, and whether the data is stale. Use this whenever the exception concerns inventory levels or a stockout/overselling risk.",
+          "Get the current canonical inventory position for a SKU: available/reserved/committed quantities per location, whether the data is stale, and the reservation rows currently holding or committing stock (orderId, quantity, status — ACTIVE/COMMITTED, scoped to your tenant and store). Use this whenever the exception concerns inventory levels, a stockout/overselling risk, or a reservation conflict.",
         parameters: {
           type: "object",
           properties: {
@@ -235,6 +235,9 @@ export class AiToolsService {
       const truth = await this.inventoryTruthService.getSkuTruth({
         tenantId: context.tenantId,
         sku,
+        // Reservation evidence is scoped to the authorized store of this
+        // investigation, on top of the always-enforced tenant scope.
+        storeId: context.storeId,
       });
 
       if (!truth) {

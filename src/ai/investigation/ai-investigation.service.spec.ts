@@ -438,6 +438,150 @@ describe("AiInvestigationService", () => {
     }
   });
 
+  // ---- D2 + reservation-holder evidence (Phase 1C) ----
+
+  it("grounds a proposal on a reservation holder returned by get_inventory_truth", async () => {
+    const aiToolsExecute = vi.fn().mockResolvedValue({
+      inventoryTruth: {
+        inventoryItemId: "item-1",
+        sku: "sku-managed-1",
+        availableQty: 2,
+        reservedQty: 5,
+        committedQty: 0,
+        reservations: [
+          { orderId: "order-holder-1", quantity: 5, status: "ACTIVE" },
+        ],
+      },
+    });
+
+    const createChatCompletion = vi
+      .fn()
+      .mockResolvedValueOnce({
+        message: {
+          role: "assistant",
+          content: null,
+          toolCalls: [
+            {
+              id: "call-1",
+              name: "get_inventory_truth",
+              arguments: { sku: "sku-managed-1" },
+            },
+          ],
+        },
+        tokensUsed: 10,
+      })
+      .mockResolvedValueOnce({
+        message: {
+          role: "assistant",
+          content: null,
+          toolCalls: [
+            {
+              id: "call-2",
+              name: SUBMIT_DECISION_PROPOSAL_TOOL,
+              arguments: {
+                actionType: "RELEASE_ORDER_RESERVATION",
+                targetEntityType: "ORDER",
+                targetEntityId: "order-holder-1",
+                confidence: 0.9,
+                basis: "TENANT_HISTORY",
+                riskTier: "HIGH",
+                reasoningSummary:
+                  "order-holder-1 holds the 5 reserved units blocking the new order.",
+                evidenceRefs: ["order-holder-1"],
+              },
+            },
+          ],
+        },
+        tokensUsed: 10,
+      });
+
+    const { service, prisma } = buildDeps({
+      createChatCompletion,
+      aiToolsExecute,
+    });
+
+    const result = await service.investigate(baseInput);
+
+    expect(result.status).toBe("COMPLETED");
+    expect(prisma.aiDecisionProposal.create).toHaveBeenCalledTimes(1);
+    expect(prisma.aiDecisionProposal.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ targetEntityId: "order-holder-1" }),
+      }),
+    );
+  });
+
+  it("cannot ground an invented or unreturned reservation holder", async () => {
+    // The tool exposes order-holder-1 only. A model that targets a
+    // different id (invented, or belonging to another tenant/store it
+    // never observed) must be rejected — the id appears nowhere in
+    // successful tool output.
+    const aiToolsExecute = vi.fn().mockResolvedValue({
+      inventoryTruth: {
+        inventoryItemId: "item-1",
+        sku: "sku-managed-1",
+        availableQty: 2,
+        reservedQty: 5,
+        committedQty: 0,
+        reservations: [
+          { orderId: "order-holder-1", quantity: 5, status: "ACTIVE" },
+        ],
+      },
+    });
+
+    const createChatCompletion = vi
+      .fn()
+      .mockResolvedValueOnce({
+        message: {
+          role: "assistant",
+          content: null,
+          toolCalls: [
+            {
+              id: "call-1",
+              name: "get_inventory_truth",
+              arguments: { sku: "sku-managed-1" },
+            },
+          ],
+        },
+        tokensUsed: 10,
+      })
+      .mockResolvedValue({
+        message: {
+          role: "assistant",
+          content: null,
+          toolCalls: [
+            {
+              id: "call-2",
+              name: SUBMIT_DECISION_PROPOSAL_TOOL,
+              arguments: {
+                actionType: "RELEASE_ORDER_RESERVATION",
+                targetEntityType: "ORDER",
+                targetEntityId: "order-unreturned-2",
+                confidence: 0.9,
+                basis: "TENANT_HISTORY",
+                riskTier: "HIGH",
+                reasoningSummary:
+                  "Releasing the reservation I believe is holding the stock.",
+                evidenceRefs: ["order-unreturned-2"],
+              },
+            },
+          ],
+        },
+        tokensUsed: 10,
+      });
+
+    const { service, prisma } = buildDeps({
+      createChatCompletion,
+      aiToolsExecute,
+    });
+
+    const result = await service.investigate(baseInput);
+
+    expect(result.status).toBe("FAILED");
+    expect(result.error).toMatch(/targetEntityId/);
+    expect(prisma.aiDecisionProposal.create).not.toHaveBeenCalled();
+  });
+
   // ---- D2 adversarial provenance regressions ----
 
   it("rejects a target echoed only in tool ARGUMENTS (input-echo attack)", async () => {

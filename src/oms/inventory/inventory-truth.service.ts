@@ -1,4 +1,4 @@
-﻿import { Injectable } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 
 import { PrismaService } from '../../prisma/prisma.service';
 
@@ -14,6 +14,22 @@ export type InventoryTruthLocation = {
   isStale: boolean;
 };
 
+/**
+ * One reservation-ledger row that currently holds or has committed stock of
+ * the item. `status` is the canonical `InventoryReservationStatus` value
+ * verbatim; only the stock-holding statuses are returned —
+ * ACTIVE (reserved) and COMMITTED (allocated). RELEASED and SHIPPED rows
+ * are terminal and are excluded as unnecessary detail.
+ *
+ * `quantity` is that ledger row's quantity (per row, not summed); one entry
+ * is returned per reservation row, ordered by orderId then row id.
+ */
+export type InventoryTruthReservation = {
+  orderId: string;
+  quantity: number;
+  status: "ACTIVE" | "COMMITTED";
+};
+
 export type InventoryTruth = {
   inventoryItemId: string;
   sku: string;
@@ -25,6 +41,14 @@ export type InventoryTruth = {
   locationCount: number;
   isStale: boolean;
   locations: InventoryTruthLocation[];
+  /**
+   * Stock-holding reservation rows for this item (ACTIVE + COMMITTED).
+   * Scoped to the tenant; scoped to the store as well when the caller
+   * passes `storeId`. Read-only evidence — it is not proof that a
+   * reservation is unchanged by execution time (pre-execution
+   * revalidation remains the authority for that).
+   */
+  reservations: InventoryTruthReservation[];
 };
 
 @Injectable()
@@ -35,6 +59,13 @@ export class InventoryTruthService {
     tenantId: string;
     sku: string;
     maxAgeMinutes?: number;
+    /**
+     * Optional store scope for the reservation evidence: when present,
+     * only reservation rows of this store are returned (tenant scope is
+     * always enforced). Callers that do not need reservation details can
+     * omit it — the aggregate truth is unchanged either way.
+     */
+    storeId?: string;
   }): Promise<InventoryTruth | null> {
     const sku = input.sku.trim();
 
@@ -129,6 +160,26 @@ export class InventoryTruthService {
       );
     }
 
+    // Reservation evidence: the stock-holding ledger rows (ACTIVE +
+    // COMMITTED) for this item, within the authorized tenant (always) and
+    // store (when requested) scope. Terminal rows (RELEASED, SHIPPED) are
+    // excluded — only rows that hold or have committed stock are relevant
+    // to shortage and reservation-conflict investigation.
+    const reservations = await this.prisma.inventoryReservation.findMany({
+      where: {
+        tenantId: input.tenantId,
+        inventoryItemId: item.id,
+        status: { in: ["ACTIVE", "COMMITTED"] },
+        ...(input.storeId ? { storeId: input.storeId } : {}),
+      },
+      orderBy: [{ orderId: "asc" }, { id: "asc" }],
+      select: {
+        orderId: true,
+        quantity: true,
+        status: true,
+      },
+    });
+
     return {
       inventoryItemId: item.id,
       sku: item.sku,
@@ -145,6 +196,11 @@ export class InventoryTruthService {
         (location) => location.isStale,
       ),
       locations,
+      reservations: reservations.map((row) => ({
+        orderId: row.orderId,
+        quantity: row.quantity,
+        status: row.status as "ACTIVE" | "COMMITTED",
+      })),
     };
   }
 }
