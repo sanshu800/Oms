@@ -793,7 +793,10 @@
               ],
               "reservations": [
                 { "orderId": "order-r7", "quantity": 5, "status": "ACTIVE" }
-              ]
+              ],
+              "reservationsScope": "STORE",
+              "unexplainedReservedQty": 0,
+              "unexplainedCommittedQty": 0
             }
           },
           "isError": false

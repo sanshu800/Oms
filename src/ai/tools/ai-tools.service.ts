@@ -58,7 +58,7 @@ export class AiToolsService {
       {
         name: "get_inventory_truth",
         description:
-          "Get the current canonical inventory position for a SKU: available/reserved/committed quantities per location, whether the data is stale, and the reservation rows currently holding or committing stock (orderId, quantity, status — ACTIVE/COMMITTED, scoped to your tenant and store). Use this whenever the exception concerns inventory levels, a stockout/overselling risk, or a reservation conflict.",
+          "Get the current canonical inventory position for a SKU: available/reserved/committed quantities per location (tenant-wide aggregates — inventory stock is shared across the tenant's stores), whether the data is stale, and the reservation rows currently holding or committing stock within your store scope (orderId, quantity, status — ACTIVE/COMMITTED). reservationsScope names the row scope; unexplainedReservedQty/unexplainedCommittedQty quantify aggregate quantity held OUTSIDE your scope (e.g. by other stores) that this evidence cannot attribute — treat unexplained holdings as unknown holders, never invent them. Use this whenever the exception concerns inventory levels, a stockout/overselling risk, or a reservation conflict.",
         parameters: {
           type: "object",
           properties: {

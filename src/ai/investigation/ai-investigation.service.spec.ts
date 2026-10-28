@@ -582,6 +582,82 @@ describe("AiInvestigationService", () => {
     expect(prisma.aiDecisionProposal.create).not.toHaveBeenCalled();
   });
 
+  it("cannot ground a cross-store reservation holder implied only by unexplained quantity", async () => {
+    // Store-scoped evidence: the authorized store holds order-holder-1;
+    // unexplainedReservedQty reveals that MORE stock is held outside the
+    // scope (e.g. another store) without naming the holder. A model that
+    // names that unseen holder must be rejected — the id exists nowhere in
+    // successful tool output, and cross-store rows are not authorized for
+    // this investigation.
+    const aiToolsExecute = vi.fn().mockResolvedValue({
+      inventoryTruth: {
+        inventoryItemId: "item-1",
+        sku: "sku-managed-1",
+        availableQty: 0,
+        reservedQty: 8,
+        committedQty: 0,
+        reservationsScope: "STORE",
+        reservations: [
+          { orderId: "order-holder-1", quantity: 2, status: "ACTIVE" },
+        ],
+        unexplainedReservedQty: 6,
+        unexplainedCommittedQty: 0,
+      },
+    });
+
+    const createChatCompletion = vi
+      .fn()
+      .mockResolvedValueOnce({
+        message: {
+          role: "assistant",
+          content: null,
+          toolCalls: [
+            {
+              id: "call-1",
+              name: "get_inventory_truth",
+              arguments: { sku: "sku-managed-1" },
+            },
+          ],
+        },
+        tokensUsed: 10,
+      })
+      .mockResolvedValue({
+        message: {
+          role: "assistant",
+          content: null,
+          toolCalls: [
+            {
+              id: "call-2",
+              name: SUBMIT_DECISION_PROPOSAL_TOOL,
+              arguments: {
+                actionType: "RELEASE_ORDER_RESERVATION",
+                targetEntityType: "ORDER",
+                targetEntityId: "order-other-store-9",
+                confidence: 0.9,
+                basis: "TENANT_HISTORY",
+                riskTier: "HIGH",
+                reasoningSummary:
+                  "The unexplained 6 reserved units must be order-other-store-9; releasing it.",
+                evidenceRefs: ["order-other-store-9"],
+              },
+            },
+          ],
+        },
+        tokensUsed: 10,
+      });
+
+    const { service, prisma } = buildDeps({
+      createChatCompletion,
+      aiToolsExecute,
+    });
+
+    const result = await service.investigate(baseInput);
+
+    expect(result.status).toBe("FAILED");
+    expect(result.error).toMatch(/targetEntityId/);
+    expect(prisma.aiDecisionProposal.create).not.toHaveBeenCalled();
+  });
+
   // ---- D2 adversarial provenance regressions ----
 
   it("rejects a target echoed only in tool ARGUMENTS (input-echo attack)", async () => {

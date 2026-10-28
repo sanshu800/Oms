@@ -244,5 +244,46 @@ describe('InventoryTruthService', () => {
       .calls[0][0].where;
     expect('storeId' in where).toBe(false);
   });
+
+  // ---- aggregate/detail scope consistency (Phase 1D) ----
+
+  it('quantifies tenant-wide aggregate quantity that store-scoped rows do not explain', async () => {
+    // Tenant-wide balances say 5 reserved / 2 committed (all stores); the
+    // authorized store only holds 2 ACTIVE + 1 COMMITTED. The evidence must
+    // say so explicitly instead of presenting inconsistent numbers.
+    const { service } = createService(singleBalance, [
+      { orderId: 'order-a', quantity: 2, status: 'ACTIVE' },
+      { orderId: 'order-b', quantity: 1, status: 'COMMITTED' },
+    ]);
+
+    const result = await service.getSkuTruth({
+      tenantId: 'tenant-1',
+      sku: 'sku-managed-1',
+      storeId: 'store-1',
+    });
+
+    expect(result?.reservationsScope).toBe('STORE');
+    expect(result?.reservedQty).toBe(5);
+    expect(result?.committedQty).toBe(2);
+    expect(result?.unexplainedReservedQty).toBe(3);
+    expect(result?.unexplainedCommittedQty).toBe(1);
+  });
+
+  it('reports tenant-scoped rows with zero unexplained quantities', async () => {
+    const { service } = createService(singleBalance, [
+      { orderId: 'order-a', quantity: 5, status: 'ACTIVE' },
+      { orderId: 'order-b', quantity: 2, status: 'COMMITTED' },
+    ]);
+
+    const result = await service.getSkuTruth({
+      tenantId: 'tenant-1',
+      sku: 'sku-managed-1',
+    });
+
+    expect(result?.reservationsScope).toBe('TENANT');
+    expect(result?.unexplainedReservedQty).toBe(0);
+    expect(result?.unexplainedCommittedQty).toBe(0);
+    expect(result?.reservations).toHaveLength(2);
+  });
 });
 

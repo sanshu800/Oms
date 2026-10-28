@@ -23,6 +23,10 @@ export type InventoryTruthLocation = {
  *
  * `quantity` is that ledger row's quantity (per row, not summed); one entry
  * is returned per reservation row, ordered by orderId then row id.
+ *
+ * Scope: rows are limited to the authorized tenant (always) and store (when
+ * the caller passes `storeId`) — the AI tool layer's uniform (tenantId,
+ * storeId) read contract. Cross-store rows are never exposed here.
  */
 export type InventoryTruthReservation = {
   orderId: string;
@@ -34,6 +38,12 @@ export type InventoryTruth = {
   inventoryItemId: string;
   sku: string;
   name: string;
+  /**
+   * Aggregates below are TENANT-WIDE by construction: balances live on
+   * (item, location) and locations belong to the tenant — there is no
+   * store dimension in the canonical balance model, and every store's
+   * reservations move them. Do not read them as store-scoped figures.
+   */
   availableQty: number;
   reservedQty: number;
   committedQty: number;
@@ -42,13 +52,32 @@ export type InventoryTruth = {
   isStale: boolean;
   locations: InventoryTruthLocation[];
   /**
-   * Stock-holding reservation rows for this item (ACTIVE + COMMITTED).
-   * Scoped to the tenant; scoped to the store as well when the caller
-   * passes `storeId`. Read-only evidence — it is not proof that a
-   * reservation is unchanged by execution time (pre-execution
-   * revalidation remains the authority for that).
+   * Which scope the `reservations` rows below cover: "STORE" when the
+   * caller passed `storeId` (rows of that store only), otherwise "TENANT"
+   * (all of the tenant's rows). Explicit because the aggregates above are
+   * always tenant-wide — with "STORE" rows the two scopes differ.
+   */
+  reservationsScope: "STORE" | "TENANT";
+  /**
+   * Stock-holding reservation rows (ACTIVE + COMMITTED) within the scope
+   * above. Read-only evidence — it is not proof that a reservation is
+   * unchanged by execution time (pre-execution revalidation remains the
+   * authority for that).
    */
   reservations: InventoryTruthReservation[];
+  /**
+   * Explicit incompleteness markers: `reservedQty`/`committedQty` minus
+   * the quantity explained by the returned rows. Non-zero values mean stock
+   * is held OUTSIDE the authorized scope (e.g. by other stores of this
+   * tenant, which this evidence set may not name) — or, if negative, that
+   * the ledger and balances disagree. Cross-store holders are required to
+   * explain the tenant-wide aggregates but are not authorized for a
+   * store-scoped investigation, so the gap is quantified rather than the
+   * foreign rows being exposed. Derived only from quantities already
+   * present above. Zero when rows are tenant-scoped and consistent.
+   */
+  unexplainedReservedQty: number;
+  unexplainedCommittedQty: number;
 };
 
 @Injectable()
@@ -180,6 +209,14 @@ export class InventoryTruthService {
       },
     });
 
+    const scopedActiveQty = reservations
+      .filter((row) => row.status === "ACTIVE")
+      .reduce((total, row) => total + row.quantity, 0);
+
+    const scopedCommittedQty = reservations
+      .filter((row) => row.status === "COMMITTED")
+      .reduce((total, row) => total + row.quantity, 0);
+
     return {
       inventoryItemId: item.id,
       sku: item.sku,
@@ -196,11 +233,17 @@ export class InventoryTruthService {
         (location) => location.isStale,
       ),
       locations,
+      reservationsScope: input.storeId ? "STORE" : "TENANT",
       reservations: reservations.map((row) => ({
         orderId: row.orderId,
         quantity: row.quantity,
         status: row.status as "ACTIVE" | "COMMITTED",
       })),
+      // Scope consistency: the aggregates are tenant-wide; the rows may be
+      // store-scoped. Quantify — never silently paper over — the part of
+      // the aggregate the authorized rows do not explain.
+      unexplainedReservedQty: reservedQty - scopedActiveQty,
+      unexplainedCommittedQty: committedQty - scopedCommittedQty,
     };
   }
 }
