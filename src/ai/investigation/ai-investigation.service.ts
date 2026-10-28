@@ -14,6 +14,7 @@ import { AiAutonomyService } from "../decision/ai-autonomy.service";
 import { LLM_CLIENT, LlmClient, LlmMessage } from "../llm/llm-client.interface";
 import {
   decisionProposalSchema,
+  isTrustedEvidenceOutput,
   isUncertaintyConclusion,
   submitDecisionProposalToolDefinition,
   SUBMIT_DECISION_PROPOSAL_TOOL,
@@ -381,6 +382,11 @@ export class AiInvestigationService {
               where: {
                 id: investigationId,
                 status: AiInvestigationStatus.RUNNING,
+                // Defense in depth: the claim is scoped to THIS tenant's
+                // investigation of THIS exception — a completion race (or a
+                // confused-id path) can never finalize another context.
+                tenantId: input.tenantId,
+                exceptionId: input.exceptionId,
               },
               data: {
                 status: AiInvestigationStatus.COMPLETED,
@@ -444,10 +450,14 @@ export class AiInvestigationService {
 
         toolCallSequence += 1;
 
-        evidenceHaystack += `${JSON.stringify({
-          input: call.arguments,
-          output,
-        })}\n`;
+        // Evidence provenance (D2): only SUCCESSFUL tool OUTPUT is
+        // evidence. Model-supplied tool arguments are claims, not
+        // observations; error payloads (string outputs or `{ error: ... }`
+        // results, including "not found" and cross-tenant denials) are not
+        // evidence either — a failing dependency may echo arbitrary ids.
+        if (isTrustedEvidenceOutput(output)) {
+          evidenceHaystack += `${JSON.stringify(output)}\n`;
+        }
 
         await this.prisma.aiToolCall.create({
           data: {
@@ -485,10 +495,14 @@ export class AiInvestigationService {
 
   /**
    * D2 provenance rule (same as InvestigationEvaluationService's grounding
-   * criterion): the target entity must appear in retrieved tool output —
-   * except uncertainty-class conclusions, which may target the exception
-   * itself — and every evidenceRef must appear in tool output or be the
-   * exception id. Fabricated ids are rejected; they are never persisted.
+   * criterion): the target entity must appear in SUCCESSFUL tool OUTPUT —
+   * never in tool arguments, failed-tool output, error strings, or model
+   * text — except uncertainty-class conclusions, which may target the
+   * exception under investigation itself. Every evidenceRef must appear in
+   * successful tool output or be the investigation's own exception id.
+   * Fabricated ids are rejected before persistence; they never become
+   * proposals. This is a provenance check only — execution-time state is
+   * revalidated separately at approval (revalidateBeforeExecution).
    */
   private checkProposalGrounding(
     proposal: {

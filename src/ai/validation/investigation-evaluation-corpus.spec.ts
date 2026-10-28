@@ -194,6 +194,7 @@ describe("investigation evaluation corpus", () => {
       "provider_failure",
       "cross_tenant_attempt",
       "prohibited_actions",
+      "adversarial_grounding",
     ];
 
     expect([...corpus.categories].sort()).toEqual([...requiredCategories].sort());

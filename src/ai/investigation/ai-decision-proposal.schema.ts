@@ -25,6 +25,32 @@ export const UNCERTAINTY_ACTION_TYPES = [
   "NO_ACTION_INSUFFICIENT_EVIDENCE",
 ] as const;
 
+/**
+ * A tool result counts as EVIDENCE only when it is a successful, structured
+ * output. Error payloads — string outputs (malformed transport) and
+ * `{ error: ... }` results ("not found", cross-tenant denials, gateway
+ * echoes) — are NOT evidence: a failing dependency may surface arbitrary
+ * ids (including other tenants'), and neither tool arguments nor error text
+ * may ground a proposal. Shared by the investigation orchestrator (submit-
+ * time enforcement) and the evaluation service (retrospective scoring) so
+ * the two provenance rules cannot drift apart.
+ */
+export function isTrustedEvidenceOutput(output: unknown): boolean {
+  if (typeof output === "string") {
+    return false;
+  }
+
+  if (typeof output !== "object" || output === null) {
+    return false;
+  }
+
+  if (Array.isArray(output)) {
+    return true;
+  }
+
+  return !("error" in output);
+}
+
 export function isUncertaintyConclusion(actionType: string): boolean {
   return (UNCERTAINTY_ACTION_TYPES as readonly string[]).includes(actionType);
 }

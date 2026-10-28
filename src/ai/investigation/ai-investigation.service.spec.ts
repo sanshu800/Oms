@@ -23,6 +23,7 @@ const validProposalArgs = {
 function buildDeps(overrides: {
   configValues?: Record<string, number | string>;
   createChatCompletion?: () => Promise<any>;
+  aiToolsExecute?: ReturnType<typeof vi.fn>;
 } = {}) {
   const configValues: Record<string, number | string> = {
     AI_INVESTIGATION_MAX_TOOL_CALLS: 5,
@@ -58,8 +59,11 @@ function buildDeps(overrides: {
   };
 
   const aiToolsService = {
-    getToolDefinitions: vi.fn().mockReturnValue([]),
-    execute: vi.fn().mockResolvedValue({ ok: true }),
+    getToolDefinitions: vi.fn().mockReturnValue([
+      { name: "get_order_detail" },
+    ]),
+    execute:
+      overrides.aiToolsExecute ?? vi.fn().mockResolvedValue({ ok: true }),
   };
 
   const aiAutonomyService = {
@@ -89,7 +93,14 @@ function buildDeps(overrides: {
     llmClient as any,
   );
 
-  return { service, prisma, auditService, llmClient, aiAutonomyService };
+  return {
+    service,
+    prisma,
+    auditService,
+    llmClient,
+    aiAutonomyService,
+    aiToolsService,
+  };
 }
 
 describe("AiInvestigationService", () => {
@@ -425,5 +436,160 @@ describe("AiInvestigationService", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // ---- D2 adversarial provenance regressions ----
+
+  it("rejects a target echoed only in tool ARGUMENTS (input-echo attack)", async () => {
+    // The model asks for `order-echo-1`; the tool returns a DIFFERENT
+    // order. Tool arguments are model claims — they must not ground.
+    const aiToolsExecute = vi
+      .fn()
+      .mockResolvedValue({ order: { id: "order-real-answer", state: "HELD" } });
+
+    const createChatCompletion = vi
+      .fn()
+      .mockResolvedValueOnce({
+        message: {
+          role: "assistant",
+          content: null,
+          toolCalls: [
+            {
+              id: "call-1",
+              name: "get_order_detail",
+              arguments: { orderId: "order-echo-1" },
+            },
+          ],
+        },
+        tokensUsed: 10,
+      })
+      .mockResolvedValue({
+        message: {
+          role: "assistant",
+          content: null,
+          toolCalls: [
+            {
+              id: "call-2",
+              name: SUBMIT_DECISION_PROPOSAL_TOOL,
+              arguments: {
+                actionType: "RELEASE_ORDER_RESERVATION",
+                targetEntityType: "ORDER",
+                targetEntityId: "order-echo-1",
+                confidence: 0.9,
+                basis: "HEURISTIC",
+                riskTier: "HIGH",
+                reasoningSummary: "Releasing the order I asked about.",
+                evidenceRefs: ["order-echo-1"],
+              },
+            },
+          ],
+        },
+        tokensUsed: 10,
+      });
+
+    const { service, prisma } = buildDeps({
+      createChatCompletion,
+      aiToolsExecute,
+    });
+
+    const result = await service.investigate(baseInput);
+
+    expect(result.status).toBe("FAILED");
+    expect(result.error).toMatch(/targetEntityId/);
+    expect(prisma.aiDecisionProposal.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects ids that appear only in error output (failed-output attack)", async () => {
+    // The tool FAILED and its error message mentions a plausible id.
+    // Error payloads are not evidence.
+    const aiToolsExecute = vi
+      .fn()
+      .mockResolvedValue({ error: "Order order-err-1 was not found" });
+
+    const createChatCompletion = vi
+      .fn()
+      .mockResolvedValueOnce({
+        message: {
+          role: "assistant",
+          content: null,
+          toolCalls: [
+            {
+              id: "call-1",
+              name: "get_order_detail",
+              arguments: { orderId: "order-anything" },
+            },
+          ],
+        },
+        tokensUsed: 10,
+      })
+      .mockResolvedValue({
+        message: {
+          role: "assistant",
+          content: null,
+          toolCalls: [
+            {
+              id: "call-2",
+              name: SUBMIT_DECISION_PROPOSAL_TOOL,
+              arguments: {
+                actionType: "ADD_ORDER_NOTE",
+                targetEntityType: "ORDER",
+                targetEntityId: "order-err-1",
+                confidence: 0.8,
+                basis: "TENANT_HISTORY",
+                riskTier: "LOW",
+                reasoningSummary: "The tool said order-err-1 exists.",
+                evidenceRefs: ["order-err-1"],
+              },
+            },
+          ],
+        },
+        tokensUsed: 10,
+      });
+
+    const { service, prisma } = buildDeps({
+      createChatCompletion,
+      aiToolsExecute,
+    });
+
+    const result = await service.investigate(baseInput);
+
+    expect(result.status).toBe("FAILED");
+    expect(result.error).toMatch(/targetEntityId/);
+    expect(prisma.aiDecisionProposal.create).not.toHaveBeenCalled();
+  });
+
+  it("a completion that loses the claim race cannot commit a proposal", async () => {
+    // Simulate a concurrent finalizer that already terminated the row:
+    // the RUNNING->COMPLETED claim matches zero rows, so the transaction
+    // must return without persisting a proposal.
+    const createChatCompletion = vi.fn().mockResolvedValue({
+      message: {
+        role: "assistant",
+        content: null,
+        toolCalls: [
+          {
+            id: "call-1",
+            name: SUBMIT_DECISION_PROPOSAL_TOOL,
+            arguments: validProposalArgs,
+          },
+        ],
+      },
+      tokensUsed: 10,
+    });
+
+    const { service, prisma, aiAutonomyService } = buildDeps({
+      createChatCompletion,
+    });
+
+    (prisma.aiInvestigation.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue(
+      { count: 0 },
+    );
+
+    const result = await service.investigate(baseInput);
+
+    expect(result.status).toBe("FAILED");
+    expect(result.error).toMatch(/timed out before the proposal/i);
+    expect(prisma.aiDecisionProposal.create).not.toHaveBeenCalled();
+    expect(aiAutonomyService.maybeAutoExecute).not.toHaveBeenCalled();
   });
 });

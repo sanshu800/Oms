@@ -5,6 +5,7 @@ import { PrismaService } from "../../prisma/prisma.service";
 import { LOW_CONFIDENCE_THRESHOLD } from "../decision-model/decision-model.types";
 import {
   REQUIRED_TARGET_ENTITY_TYPE,
+  isTrustedEvidenceOutput,
   isUncertaintyConclusion,
 } from "../investigation/ai-decision-proposal.schema";
 import {
@@ -70,26 +71,15 @@ export class InvestigationEvaluationService {
     });
 
     const errorText = investigation.error ?? null;
-    // Error outputs are NOT evidence: the pipeline records failed tool calls
-    // as string payloads or `{ error: ... }` output objects (see
-    // AiInvestigationService.logCall), and a failing dependency may echo
-    // arbitrary garbage — including other tenants' ids — on the wire.
-    // Grounding must come from successful, structured reads only.
-    const isErrorOutput = (output: unknown): boolean =>
-      typeof output === "string" ||
-      (typeof output === "object" &&
-        output !== null &&
-        !Array.isArray(output) &&
-        "error" in output);
-
+    // Evidence provenance (shared rule — see isTrustedEvidenceOutput):
+    // grounding comes from SUCCESSFUL tool OUTPUT only. Tool arguments are
+    // model claims; error payloads (string / `{ error: ... }`) may echo
+    // arbitrary ids. Both are excluded so input-echo and failed-output
+    // grounding attacks cannot score as evidence.
     const haystack = JSON.stringify(
-      investigation.toolCalls.map((call) => ({
-        toolName: call.toolName,
-        input: call.input,
-        output: isErrorOutput(call.output)
-          ? { error: "tool call failed" }
-          : call.output,
-      })),
+      investigation.toolCalls.flatMap((call) =>
+        isTrustedEvidenceOutput(call.output) ? [call.output] : [],
+      ),
     );
 
     const grounding = this.assessGrounding({
@@ -178,12 +168,12 @@ export class InvestigationEvaluationService {
       return "INSUFFICIENT_EVIDENCE";
     }
 
-    // No tool calls at all means nothing was retrieved: any conclusion
-    // would rest on invented facts.
-    if (input.haystack.length <= 2) {
-      return "INSUFFICIENT_EVIDENCE";
-    }
-
+    // The per-proposal rule below is deliberately applied even when there
+    // is NO successful tool output at all: a concrete action naming an
+    // unobserved id is then an UNSUPPORTED fabrication (not merely
+    // "unavailable"), while an uncertainty conclusion targeting the
+    // exception under investigation remains the explicitly allowed,
+    // honest outcome.
     let allGrounded = true;
 
     for (const proposal of input.proposals) {
