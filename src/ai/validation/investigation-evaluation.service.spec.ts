@@ -14,6 +14,7 @@ function buildService(rows: {
   investigation: {
     status: "COMPLETED" | "FAILED" | "RUNNING";
     error?: string | null;
+    failureCode?: string | null;
     tokensUsed?: number | null;
     toolCallCount?: number;
     toolCalls?: Array<{ toolName: string; input: unknown; output: unknown }>;
@@ -33,6 +34,7 @@ function buildService(rows: {
         tenantId: baseInput.tenantId,
         status: rows.investigation.status,
         error: rows.investigation.error ?? null,
+        failureCode: rows.investigation.failureCode ?? null,
         tokensUsed:
           rows.investigation.tokensUsed === undefined
             ? 10
@@ -408,5 +410,88 @@ describe("InvestigationEvaluationService", () => {
     await expect(service.evaluate(baseInput)).rejects.toThrow(
       /not found in this tenant/i,
     );
+  });
+});
+
+describe("runtime failure decoupling (Phase 2C)", () => {
+  it("classifies OUTPUT_VALIDATION_FAILED from the stable code, not from message text", async () => {
+    const service = buildService({
+      investigation: {
+        status: "FAILED",
+        // Structured code present; message contains NONE of the legacy
+        // phrases ("invalid decision proposal", "did not correct").
+        error: "run terminated after repeated schema rejects",
+        failureCode: "OUTPUT_VALIDATION_FAILED",
+      },
+    });
+
+    const report = await service.evaluate(baseInput);
+
+    expect(report.metrics.schemaValidationFailureObserved).toBe(true);
+    const schema = report.criteria.find((c) => c.id === "schema_validity");
+    expect(schema?.status).toBe("FAIL");
+  });
+
+  it("still classifies legacy rows via message text when no code was recorded", async () => {
+    const service = buildService({
+      investigation: {
+        status: "FAILED",
+        error:
+          "Model submitted an invalid decision proposal 2 times and did not correct it: bad",
+        failureCode: null,
+      },
+    });
+
+    const report = await service.evaluate(baseInput);
+
+    expect(report.metrics.schemaValidationFailureObserved).toBe(true);
+    const schema = report.criteria.find((c) => c.id === "schema_validity");
+    expect(schema?.status).toBe("FAIL");
+  });
+
+  it("recognizes terminated-at-bound outcomes from TIMEOUT / BUDGET_EXCEEDED codes", async () => {
+    for (const [code, error] of [
+      ["TIMEOUT", "run stopped at the deadline"],
+      ["BUDGET_EXCEEDED", "run stopped at the configured ceiling"],
+    ] as const) {
+      const service = buildService({
+        investigation: {
+          status: "FAILED",
+          // Messages match NONE of the legacy bound phrases.
+          error,
+          failureCode: code,
+        },
+      });
+
+      const report = await service.evaluate(baseInput);
+      const bounded = report.criteria.find(
+        (c) => c.id === "bounded_tool_calls",
+      );
+
+      expect(bounded?.status).toBe("PASS");
+      expect(bounded?.detail).toContain("explicit bound");
+    }
+  });
+
+  it("does not treat unrelated failures as terminated-at-bound or validation failures", async () => {
+    const service = buildService({
+      investigation: {
+        status: "FAILED",
+        error: "provider exploded",
+        failureCode: "PROVIDER_UNAVAILABLE",
+      },
+    });
+
+    const report = await service.evaluate(baseInput);
+
+    const bounded = report.criteria.find((c) => c.id === "bounded_tool_calls");
+    const schema = report.criteria.find((c) => c.id === "schema_validity");
+    // The run failed for an unrelated reason and stayed within its turn
+    // bound — that is NOT terminated-at-bound evidence for the bound
+    // criterion's explicit-bound branch, and NOT a validation rejection.
+    expect(bounded?.status).toBe("PASS");
+    expect(bounded?.detail).toContain("within the configured turn bound");
+    expect(schema?.status).toBe("UNAVAILABLE");
+    expect(report.metrics.schemaValidationFailureObserved).toBe(false);
   });
 });

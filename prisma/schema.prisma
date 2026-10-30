@@ -1144,6 +1144,11 @@ model AiInvestigation {
 
   error String?
 
+  // Phase 2C: stable machine-readable RuntimeFailure code for the terminal
+  // outcome (TIMEOUT, CANCELLED, BUDGET_EXCEEDED, OUTPUT_VALIDATION_FAILED,
+  // ...). `error` stays the human-readable text.
+  failureCode String?
+
   // Phase 2B execution lease: claimed by the worker executing this run's
   // tool loop. A claim is valid while the row is RUNNING and the claim is
   // newer than the configured lease; expired claims mark abandoned runs.
@@ -1676,4 +1681,135 @@ model ShippingEvent {
   @@unique([connectionId, externalEventId])
   @@index([tenantId, connectionId, status, receivedAt])
   @@index([shipmentId])
+}
+
+// ============================================================
+// Phase 2C: runtime usage accounting and tenant budgets.
+// Tables are created in migration 20261030150000_ai_runtime_accounting.
+// ============================================================
+
+enum AiUsageSource {
+  REPORTED
+  ESTIMATED
+  UNKNOWN
+}
+
+enum AiModelCallOutcome {
+  SUCCESS
+  TIMEOUT
+  CANCELLED
+  RATE_LIMITED
+  AUTHENTICATION_FAILED
+  PROVIDER_UNAVAILABLE
+  PROVIDER_ERROR
+  INVALID_RESPONSE
+  INTERNAL_ERROR
+}
+
+enum AiCostStatus {
+  CALCULATED
+  UNKNOWN_PRICING
+  NOT_CALCULABLE
+}
+
+enum AiBudgetLedgerStatus {
+  PENDING
+  SETTLED
+  RELEASED
+}
+
+enum AiBudgetPeriodKind {
+  DAY
+  MONTH
+}
+
+// One row per actual model invocation. Usage metadata only — never
+// prompts, credentials, or personal data.
+model AiModelCall {
+  id String @id @default(uuid()) @db.Uuid
+
+  tenantId        String @db.Uuid
+  storeId         String @db.Uuid
+  investigationId String @db.Uuid
+
+  provider String
+  model    String
+
+  inputTokens  Int?
+  outputTokens Int?
+  totalTokens  Int?
+  usageSource  AiUsageSource @default(UNKNOWN)
+
+  outcome     AiModelCallOutcome
+  failureCode String?
+  latencyMs   Int?
+
+  // Versioned cost (micros, integer). NULL + UNKNOWN_PRICING when the
+  // model has no pricing entry — never silently zero.
+  pricingVersion   String?
+  currency         String?
+  inputCostMicros  BigInt?
+  outputCostMicros BigInt?
+  totalCostMicros  BigInt?
+  costStatus       AiCostStatus @default(UNKNOWN_PRICING)
+
+  occurredAt DateTime @default(now())
+
+  @@index([tenantId, investigationId])
+  @@index([tenantId, occurredAt])
+}
+
+// Append-only budget reservation/settlement ledger. PENDING = conservative
+// token reservation before a model call; settlement is a guarded
+// PENDING -> SETTLED transition (idempotent by construction).
+model AiBudgetLedger {
+  id String @id @default(uuid()) @db.Uuid
+
+  tenantId        String @db.Uuid
+  storeId         String @db.Uuid
+  investigationId String @db.Uuid
+
+  periodDay   String
+  periodMonth String
+
+  reservedTokens Int
+  actualTokens   Int?
+  usageSource    AiUsageSource   @default(UNKNOWN)
+  status         AiBudgetLedgerStatus @default(PENDING)
+  // True when actual usage is unknown (timeout/cancel/failure) and the
+  // conservative reservation stands as the accounted consumption.
+  uncertain Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  settledAt DateTime?
+
+  @@index([tenantId, periodDay])
+  @@index([status, createdAt])
+  @@index([investigationId])
+}
+
+// Per-tenant period token counters. Reservation = atomic conditional
+// increment (see migration): concurrent investigations cannot both spend
+// the same remaining budget.
+model AiBudgetCounter {
+  id String @id @default(uuid()) @db.Uuid
+
+  tenantId     String
+  periodKind   AiBudgetPeriodKind
+  periodKey    String
+  reservedTokens Int @default(0)
+
+  @@unique([tenantId, periodKind, periodKey])
+}
+
+// Operator-approved per-tenant budget overrides (audited service method).
+// NULL = use the configured default limit.
+model AiTenantBudgetLimit {
+  id String @id @default(uuid()) @db.Uuid
+
+  tenantId          String @unique
+  dailyTokenLimit   Int?
+  monthlyTokenLimit Int?
+  updatedBy         String?
+  updatedAt         DateTime @default(now()) @updatedAt
 }

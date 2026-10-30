@@ -80,12 +80,33 @@ function buildDeps(overrides: {
   };
 
   const llmClient = {
+    provider: "test",
     createChatCompletion:
       overrides.createChatCompletion ??
       vi.fn().mockResolvedValue({
         message: { role: "assistant", content: "no tool calls" },
         tokensUsed: 10,
+        usage: {
+          inputTokens: 5,
+          outputTokens: 5,
+          totalTokens: 10,
+          source: "ESTIMATED",
+        },
       }),
+  };
+
+  const usageService = {
+    recordModelCall: vi.fn().mockResolvedValue({ id: "model-call-1" }),
+  };
+
+  const budgetService = {
+    usageSummary: vi
+      .fn()
+      .mockResolvedValue({ entries: 0, reservedTokens: 0 }),
+    limitsFor: vi.fn().mockImplementation((_t: string, d: unknown) => Promise.resolve(d)),
+    reserve: vi.fn().mockResolvedValue({ id: "entry-1", reservedTokens: 4000 }),
+    settle: vi.fn().mockResolvedValue(undefined),
+    release: vi.fn().mockResolvedValue(undefined),
   };
 
   const service = new AiInvestigationService(
@@ -96,6 +117,8 @@ function buildDeps(overrides: {
     aiAutonomyService as any,
     config as any,
     llmClient as any,
+    usageService as any,
+    budgetService as any,
   );
 
   return {
@@ -338,6 +361,20 @@ describe("AiInvestigationService", () => {
       { maybeAutoExecute: vi.fn().mockResolvedValue(undefined) } as any,
       { get: (key: string) => configValues[key as keyof typeof configValues] } as any,
       { createChatCompletion } as any,
+      { recordModelCall: vi.fn().mockResolvedValue({ id: "model-call-1" }) } as any,
+      {
+        usageSummary: vi
+          .fn()
+          .mockResolvedValue({ entries: 0, reservedTokens: 0 }),
+        limitsFor: vi
+          .fn()
+          .mockImplementation((_t: string, d: unknown) => Promise.resolve(d)),
+        reserve: vi
+          .fn()
+          .mockResolvedValue({ id: "entry-1", reservedTokens: 4000 }),
+        settle: vi.fn().mockResolvedValue(undefined),
+        release: vi.fn().mockResolvedValue(undefined),
+      } as any,
     );
 
     const result = await service.investigate(baseInput);

@@ -36,16 +36,30 @@ export class LlmClientError extends Error {
   readonly kind: LlmFailureKind;
   readonly status?: number;
   readonly retryable: boolean;
+  /**
+   * Phase 2C accounting honesty: "none" when the request provably never
+   * left (pre-dispatch cancellation) — safe to refund the reservation;
+   * "unknown" when the provider may have consumed tokens (timeout,
+   * mid-flight abort, transport loss) — the conservative reservation
+   * stands and the account is marked uncertain. Never invent usage.
+   */
+  readonly usageDisposition?: "none" | "unknown";
 
   constructor(
     kind: LlmFailureKind,
     message: string,
-    options: { status?: number; retryable?: boolean; cause?: unknown } = {},
+    options: {
+      status?: number;
+      retryable?: boolean;
+      cause?: unknown;
+      usageDisposition?: "none" | "unknown";
+    } = {},
   ) {
     super(message, { cause: options.cause });
     this.name = "LlmClientError";
     this.kind = kind;
     this.status = options.status;
+    this.usageDisposition = options.usageDisposition;
     this.retryable =
       options.retryable ??
       (kind === "timeout" || kind === "transport" || kind === "http");

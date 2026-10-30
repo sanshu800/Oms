@@ -157,6 +157,39 @@ const schema = z
       .min(1)
       .default(8),
 
+    // Phase 2C: usage accounting and budget governance (safe defaults;
+    // per-tenant overrides via AiTenantBudgetLimit).
+    AI_INVESTIGATION_MAX_MODEL_CALLS: z
+      .coerce
+      .number()
+      .int()
+      .min(1)
+      .default(24),
+    AI_INVESTIGATION_TOKEN_LIMIT: z
+      .coerce
+      .number()
+      .int()
+      .min(1)
+      .default(100000),
+    AI_BUDGET_RESERVATION_TOKENS: z
+      .coerce
+      .number()
+      .int()
+      .min(1)
+      .default(4000),
+    AI_TENANT_DAILY_TOKEN_LIMIT: z
+      .coerce
+      .number()
+      .int()
+      .min(1)
+      .default(2000000),
+    AI_TENANT_MONTHLY_TOKEN_LIMIT: z
+      .coerce
+      .number()
+      .int()
+      .min(1)
+      .default(40000000),
+
     AI_INVESTIGATION_TIMEOUT_MS: z
       .coerce
       .number()

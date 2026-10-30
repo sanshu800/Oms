@@ -71,6 +71,14 @@ export class ScriptedLlmClient implements LlmClient {
         })),
       },
       tokensUsed: 10,
+      // Deterministic test double: usage is ESTIMATED by the double, not
+      // reported by a provider.
+      usage: {
+        inputTokens: 5,
+        outputTokens: 5,
+        totalTokens: 10,
+        source: "ESTIMATED",
+      },
     };
   }
 }

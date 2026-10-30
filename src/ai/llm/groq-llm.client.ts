@@ -32,6 +32,8 @@ const DEFAULT_PROVIDER_TIMEOUT_MS = 30_000;
  */
 @Injectable()
 export class GroqLlmClient implements LlmClient {
+  readonly provider = "groq";
+
   private client: Groq | null = null;
 
   constructor(private readonly config: ConfigService) {}
@@ -84,6 +86,7 @@ export class GroqLlmClient implements LlmClient {
       throw new LlmClientError(
         "cancelled",
         "Provider call cancelled before dispatch (investigation run aborted)",
+        { usageDisposition: "none" },
       );
     }
 
@@ -132,6 +135,21 @@ export class GroqLlmClient implements LlmClient {
     return {
       message: fromGroqMessage(choice.message),
       tokensUsed: completion.usage?.total_tokens ?? null,
+      // Phase 2C: provider-reported usage with honest provenance. Missing
+      // usage stays null/UNKNOWN — never estimated from the prompt.
+      usage: completion.usage
+        ? {
+            inputTokens: completion.usage.prompt_tokens ?? null,
+            outputTokens: completion.usage.completion_tokens ?? null,
+            totalTokens: completion.usage.total_tokens ?? null,
+            source: "REPORTED",
+          }
+        : {
+            inputTokens: null,
+            outputTokens: null,
+            totalTokens: null,
+            source: "UNKNOWN",
+          },
     };
   }
 }
@@ -155,7 +173,7 @@ export function classifyProviderError(
     return new LlmClientError(
       "cancelled",
       `Provider call cancelled by the owning investigation run: ${message}`,
-      { cause: error, retryable: false },
+      { cause: error, retryable: false, usageDisposition: "unknown" },
     );
   }
 
@@ -163,15 +181,22 @@ export function classifyProviderError(
     return new LlmClientError("cancelled", message, {
       cause: error,
       retryable: false,
+      usageDisposition: "unknown",
     });
   }
 
   if (error instanceof Groq.APIConnectionTimeoutError) {
-    return new LlmClientError("timeout", message, { cause: error });
+    return new LlmClientError("timeout", message, {
+      cause: error,
+      usageDisposition: "unknown",
+    });
   }
 
   if (error instanceof Groq.APIConnectionError) {
-    return new LlmClientError("transport", message, { cause: error });
+    return new LlmClientError("transport", message, {
+      cause: error,
+      usageDisposition: "unknown",
+    });
   }
 
   if (error instanceof Groq.APIError) {
@@ -182,12 +207,16 @@ export function classifyProviderError(
       cause: error,
       status,
       retryable: status === 429 || (status !== undefined && status >= 500),
+      // Rejections (429/4xx) did not generate; 5xx may have.
+      usageDisposition:
+        status !== undefined && status >= 500 ? "unknown" : "none",
     });
   }
 
   return new LlmClientError("transport", message, {
     cause: error,
     retryable: false,
+    usageDisposition: "unknown",
   });
 }
 

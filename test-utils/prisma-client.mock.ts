@@ -209,4 +209,38 @@ export const ShippingRequestStatus = {
   FAILED: "FAILED",
   CANCELLED: "CANCELLED",
 } as const;
+
+export const AiUsageSource = {
+  REPORTED: "REPORTED",
+  ESTIMATED: "ESTIMATED",
+  UNKNOWN: "UNKNOWN",
+} as const;
+
+export const AiModelCallOutcome = {
+  SUCCESS: "SUCCESS",
+  TIMEOUT: "TIMEOUT",
+  CANCELLED: "CANCELLED",
+  RATE_LIMITED: "RATE_LIMITED",
+  AUTHENTICATION_FAILED: "AUTHENTICATION_FAILED",
+  PROVIDER_UNAVAILABLE: "PROVIDER_UNAVAILABLE",
+  PROVIDER_ERROR: "PROVIDER_ERROR",
+  INVALID_RESPONSE: "INVALID_RESPONSE",
+  INTERNAL_ERROR: "INTERNAL_ERROR",
+} as const;
+
+export const AiCostStatus = {
+  CALCULATED: "CALCULATED",
+  UNKNOWN_PRICING: "UNKNOWN_PRICING",
+} as const;
+
+export const AiBudgetLedgerStatus = {
+  PENDING: "PENDING",
+  SETTLED: "SETTLED",
+  RELEASED: "RELEASED",
+} as const;
+
+export const AiBudgetPeriodKind = {
+  DAY: "DAY",
+  MONTH: "MONTH",
+} as const;
 // </generated-enums>

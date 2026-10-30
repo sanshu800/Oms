@@ -71,6 +71,12 @@ export class InvestigationEvaluationService {
     });
 
     const errorText = investigation.error ?? null;
+    // Phase 2C: outcome classification comes from the stable RuntimeFailure
+    // code recorded on the investigation row (AiInvestigation.failureCode) —
+    // never from error message text. Legacy string matching survives only
+    // as a fallback for rows recorded before failureCode existed, so
+    // existing scripts and fixtures remain compatible.
+    const failureCode = investigation.failureCode ?? null;
     // Evidence provenance (shared rule — see isTrustedEvidenceOutput):
     // grounding comes from SUCCESSFUL tool OUTPUT only. Tool arguments are
     // model claims; error payloads (string / `{ error: ... }`) may echo
@@ -90,12 +96,12 @@ export class InvestigationEvaluationService {
 
     const criteria: CriterionResult[] = [
       this.checkCompleted(investigation.status, errorText),
-      this.checkSchemaValidity(proposals.length, errorText),
+      this.checkSchemaValidity(proposals.length, failureCode, errorText),
       this.checkActionTypes(proposals),
       this.checkTargetEntities(proposals),
       this.checkGrounding(grounding, proposals),
       this.checkUncertainty(grounding, proposals),
-      this.checkBounded(investigation.toolCallCount, errorText),
+      this.checkBounded(investigation.toolCallCount, failureCode, errorText),
       this.checkLowConfidence(proposals),
       {
         id: "untrusted_external_text",
@@ -117,10 +123,11 @@ export class InvestigationEvaluationService {
       toolCallCount: investigation.toolCallCount,
       completionStatus: investigation.status,
       schemaValidationFailures: null,
-      schemaValidationFailureObserved:
-        errorText !== null &&
-        /invalid decision proposal/i.test(errorText) &&
-        /did not correct/i.test(errorText),
+      schemaValidationFailureObserved: failureCode !== null
+        ? failureCode === "OUTPUT_VALIDATION_FAILED"
+        : errorText !== null &&
+          /invalid decision proposal/i.test(errorText) &&
+          /did not correct/i.test(errorText),
       evidenceGrounding: grounding,
       providerFailure: errorText,
       providerCallLatencyMs: null,
@@ -228,6 +235,7 @@ export class InvestigationEvaluationService {
 
   private checkSchemaValidity(
     proposalCount: number,
+    failureCode: string | null,
     errorText: string | null,
   ): CriterionResult {
     if (proposalCount > 0) {
@@ -238,7 +246,14 @@ export class InvestigationEvaluationService {
       };
     }
 
-    if (errorText && /invalid decision proposal/i.test(errorText)) {
+    // Structured classification first; message matching only for legacy
+    // rows that predate RuntimeFailure codes.
+    const rejectedProposals =
+      failureCode !== null
+        ? failureCode === "OUTPUT_VALIDATION_FAILED"
+        : Boolean(errorText && /invalid decision proposal/i.test(errorText));
+
+    if (rejectedProposals) {
       return {
         id: "schema_validity",
         status: "FAIL",
@@ -450,12 +465,18 @@ export class InvestigationEvaluationService {
 
   private checkBounded(
     toolCallCount: number,
+    failureCode: string | null,
     errorText: string | null,
   ): CriterionResult {
     const bound = this.config?.get<number>("AI_INVESTIGATION_MAX_TOOL_CALLS") ?? 8;
+    // Terminated-at-bound outcomes carry stable codes (TIMEOUT = time
+    // bound; BUDGET_EXCEEDED = token/call/iteration budget). Message
+    // matching is only the fallback for pre-code legacy rows.
     const hitExplicitBound =
-      errorText !== null &&
-      /(tool-call budget|token budget|timed out)/i.test(errorText);
+      failureCode !== null
+        ? failureCode === "TIMEOUT" || failureCode === "BUDGET_EXCEEDED"
+        : errorText !== null &&
+          /(tool-call budget|token budget|timed out)/i.test(errorText);
 
     if (hitExplicitBound) {
       return {

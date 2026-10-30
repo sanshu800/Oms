@@ -1,0 +1,20 @@
+{
+  "pricingVersion": "2026-10-30.1",
+  "currency": "USD",
+  "priceSource": "Operator-maintained configuration. Prices here are CONFIGURATION DATA, not provider truth: verify against the provider's published price list before trusting computed cost figures. The system never hardcodes prices in logic and treats missing entries as UNKNOWN_PRICING (never zero).",
+  "unit": "micros per 1M tokens",
+  "models": {
+    "groq:llama-3.1-8b-instant": {
+      "inputMicrosPer1M": 500000,
+      "outputMicrosPer1M": 800000
+    },
+    "groq:llama-3.3-70b-versatile": {
+      "inputMicrosPer1M": 590000,
+      "outputMicrosPer1M": 790000
+    },
+    "groq:openai/gpt-oss-120b": {
+      "inputMicrosPer1M": 150000,
+      "outputMicrosPer1M": 600000
+    }
+  }
+}

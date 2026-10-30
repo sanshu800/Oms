@@ -52,12 +52,30 @@ export type LlmChatCompletionInput = {
   signal?: AbortSignal;
 };
 
+/**
+ * Token usage for one model invocation. `source` is provenance, not
+ * decoration: REPORTED = provider-reported, ESTIMATED = derived by a test
+ * double or estimator, UNKNOWN = not available. Fields stay nullable —
+ * missing usage is represented as missing, never invented.
+ */
+export type LlmUsage = {
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  totalTokens?: number | null;
+  source: "REPORTED" | "ESTIMATED" | "UNKNOWN";
+};
+
 export type LlmChatCompletionResult = {
   message: LlmMessage;
   tokensUsed: number | null;
+  /** Phase 2C: structured usage with provenance (optional for compat). */
+  usage?: LlmUsage;
 };
 
 export interface LlmClient {
+  /** Provider identity for usage accounting (optional for compat). */
+  readonly provider?: string;
+
   createChatCompletion(
     input: LlmChatCompletionInput,
   ): Promise<LlmChatCompletionResult>;

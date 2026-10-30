@@ -21,6 +21,9 @@ import { AiActuationService } from "./actuation/ai-actuation.service";
 import { ShopifyActionAdapter } from "./actuation/shopify-action.adapter";
 import { ACTION_ADAPTERS } from "./actuation/action-adapter.interface";
 import { GroqLlmClient } from "./llm/groq-llm.client";
+import { ModelPricingService } from "./accounting/model-pricing.service";
+import { AiUsageService } from "./accounting/ai-usage.service";
+import { AiBudgetService } from "./accounting/ai-budget.service";
 import { LLM_CLIENT } from "./llm/llm-client.interface";
 import { AI_INVESTIGATION_QUEUE } from "./queue/ai-investigation.queue";
 import { AiInvestigationWorker } from "./queue/ai-investigation.worker";
@@ -43,6 +46,9 @@ import { AiInvestigationWorker } from "./queue/ai-investigation.worker";
     AiAutonomyPolicyController,
   ],
   providers: [
+    ModelPricingService,
+    AiUsageService,
+    AiBudgetService,
     AiToolsService,
     AiInvestigationService,
     AiInvestigationWorker,

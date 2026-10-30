@@ -13,7 +13,24 @@ import { ExceptionService } from "../../oms/exception/exception.service";
 import { AuditService } from "../../oms/audit/audit.service";
 import { AiToolsService } from "../tools/ai-tools.service";
 import { AiAutonomyService } from "../decision/ai-autonomy.service";
-import { LLM_CLIENT, LlmClient, LlmMessage } from "../llm/llm-client.interface";
+import {
+  LLM_CLIENT,
+  LlmClient,
+  LlmChatCompletionInput,
+  LlmChatCompletionResult,
+  LlmMessage,
+} from "../llm/llm-client.interface";
+import {
+  AiBudgetService,
+  BudgetExceededError,
+} from "../accounting/ai-budget.service";
+import { AiUsageService } from "../accounting/ai-usage.service";
+import {
+  classifyThrownError,
+  outcomeCodeForModelCall,
+  runtimeFailure,
+  type RuntimeFailure,
+} from "../runtime/runtime-failure";
 import {
   decisionProposalSchema,
   isTrustedEvidenceOutput,
@@ -42,6 +59,12 @@ export type InvestigateResult = {
   status: "COMPLETED" | "FAILED";
   proposalId?: string;
   error?: string;
+  /**
+   * Phase 2C: stable machine-readable failure classification. `error` keeps
+   * the human-readable text; consumers branch on `failure.code`, never on
+   * message strings.
+   */
+  failure?: RuntimeFailure;
   /**
    * Phase 2B: true when this dispatch did NOT execute the investigation —
    * another live run already owned the same tenant/store/exception scope.
@@ -130,6 +153,8 @@ export class AiInvestigationService {
     private readonly aiAutonomyService: AiAutonomyService,
     private readonly config: ConfigService,
     @Inject(LLM_CLIENT) private readonly llmClient: LlmClient,
+    private readonly usageService: AiUsageService,
+    private readonly budgetService: AiBudgetService,
   ) {}
 
   async investigate(input: InvestigateInput): Promise<InvestigateResult> {
@@ -180,6 +205,10 @@ export class AiInvestigationService {
       ]);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      const failure = classifyRunFailure(error, message, {
+        timedOut,
+        cancelled: controller.signal.aborted,
+      });
 
       this.logger.error(
         `Investigation failed for exception ${input.exceptionId}: ${message}`,
@@ -189,7 +218,12 @@ export class AiInvestigationService {
         // The row exists and THIS run holds (or held) its execution
         // claim: finalize it (guarded — no second row, no double audit
         // trail, and a lost claim makes the write a no-op).
-        await this.markFailed(investigationId, message, executionClaimId);
+        await this.markFailed(
+          investigationId,
+          message,
+          executionClaimId,
+          failure.code,
+        );
 
         await this.auditService.recordEvent({
           tenantId: input.tenantId,
@@ -198,13 +232,18 @@ export class AiInvestigationService {
           actorType: AuditActorType.AI_AGENT,
           entityType: "OPERATIONAL_EXCEPTION",
           entityId: input.exceptionId,
-          metadata: { investigationId, error: message },
+          metadata: {
+            investigationId,
+            error: message,
+            failureCode: failure.code,
+          },
         });
 
         return {
           investigationId,
           status: "FAILED",
           error: message,
+          failure,
         };
       }
 
@@ -215,11 +254,12 @@ export class AiInvestigationService {
           investigationId,
           status: "FAILED",
           error: message,
+          failure,
           attachedToActiveRun: true,
         };
       }
 
-      return this.failWithoutInvestigationRow(input, message);
+      return this.failWithoutInvestigationRow(input, message, failure);
     } finally {
       if (timer) {
         clearTimeout(timer);
@@ -254,6 +294,10 @@ export class AiInvestigationService {
         investigationId: "",
         status: "FAILED",
         error: "Investigation timed out",
+        failure: runtimeFailure(
+          "TIMEOUT",
+          "Investigation timed out before the execution claim was created",
+        ),
       };
     }
 
@@ -297,6 +341,7 @@ export class AiInvestigationService {
           claim.investigationId,
           result.error ?? "Unknown failure",
           claim.claimId,
+          result.failure?.code ?? null,
         );
 
         await this.auditService.recordEvent({
@@ -309,6 +354,7 @@ export class AiInvestigationService {
           metadata: {
             investigationId: claim.investigationId,
             error: result.error,
+            failureCode: result.failure?.code ?? null,
           },
         });
 
@@ -316,6 +362,7 @@ export class AiInvestigationService {
           investigationId: claim.investigationId,
           status: "FAILED",
           error: result.error,
+          failure: result.failure,
         };
       }
 
@@ -339,8 +386,17 @@ export class AiInvestigationService {
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      const failure = classifyRunFailure(error, message, {
+        timedOut: runContext.isCancelled(),
+        cancelled: runContext.signal.aborted,
+      });
 
-      await this.markFailed(claim.investigationId, message, claim.claimId);
+      await this.markFailed(
+        claim.investigationId,
+        message,
+        claim.claimId,
+        failure.code,
+      );
 
       await this.auditService.recordEvent({
         tenantId: input.tenantId,
@@ -352,6 +408,7 @@ export class AiInvestigationService {
         metadata: {
           investigationId: claim.investigationId,
           error: message,
+          failureCode: failure.code,
         },
       });
 
@@ -359,6 +416,7 @@ export class AiInvestigationService {
         investigationId: claim.investigationId,
         status: "FAILED",
         error: message,
+        failure,
       };
     }
   }
@@ -370,7 +428,12 @@ export class AiInvestigationService {
     claimId: string,
     signal: AbortSignal,
     initialSequence = 0,
-  ): Promise<{ status: "COMPLETED" | "FAILED"; proposalId?: string; error?: string }> {
+  ): Promise<{
+    status: "COMPLETED" | "FAILED";
+    proposalId?: string;
+    error?: string;
+    failure?: RuntimeFailure;
+  }> {
     const readTools = this.aiToolsService.getToolDefinitions();
     const tools = [...readTools, submitDecisionProposalToolDefinition];
 
@@ -394,7 +457,7 @@ export class AiInvestigationService {
     let evidenceHaystack = "";
 
     for (let iteration = 0; iteration < maxToolCalls; iteration++) {
-      const completion = await this.llmClient.createChatCompletion({
+      const completion = await this.callModelAccounted(input, investigationId, {
         messages,
         tools,
         signal,
@@ -412,6 +475,11 @@ export class AiInvestigationService {
         return {
           status: "FAILED",
           error: `Investigation exceeded its token budget (${totalTokens}/${maxTokens}) before reaching a conclusion`,
+          failure: runtimeFailure(
+            "BUDGET_EXCEEDED",
+            `Per-investigation token budget exhausted (${totalTokens}/${maxTokens})`,
+            { retryable: false },
+          ),
         };
       }
 
@@ -442,6 +510,11 @@ export class AiInvestigationService {
               return {
                 status: "FAILED",
                 error: `Model submitted an invalid decision proposal ${invalidProposalAttempts} times and did not correct it: ${parsed.error.message}`,
+                failure: runtimeFailure(
+                  "OUTPUT_VALIDATION_FAILED",
+                  `Decision proposal failed schema validation ${invalidProposalAttempts} times without correction`,
+                  { retryable: false },
+                ),
               };
             }
 
@@ -480,6 +553,11 @@ export class AiInvestigationService {
               return {
                 status: "FAILED",
                 error: `Model submitted an invalid decision proposal ${invalidProposalAttempts} times and did not correct it: ${groundingIssue}`,
+                failure: runtimeFailure(
+                  "OUTPUT_VALIDATION_FAILED",
+                  `Decision proposal failed grounding ${invalidProposalAttempts} times without correction`,
+                  { retryable: false },
+                ),
               };
             }
 
@@ -548,6 +626,10 @@ export class AiInvestigationService {
             return {
               status: "FAILED",
               error: "Investigation timed out before the proposal could be recorded",
+              failure: runtimeFailure(
+                "TIMEOUT",
+                "Investigation timed out before the proposal could be recorded",
+              ),
             };
           }
 
@@ -613,6 +695,11 @@ export class AiInvestigationService {
       status: "FAILED",
       error:
         "Investigation ended without a valid submit_decision_proposal call within the tool-call budget",
+      failure: runtimeFailure(
+        "BUDGET_EXCEEDED",
+        "Investigation ended without a valid submit_decision_proposal call within the tool-call budget",
+        { retryable: false },
+      ),
     };
   }
 
@@ -658,6 +745,7 @@ export class AiInvestigationService {
     investigationId: string,
     error: string,
     claimId?: string | null,
+    failureCode?: string | null,
   ) {
     // Guarded transition: only a RUNNING investigation can fail, and — when
     // the caller held one — only while it still holds the execution lease.
@@ -673,6 +761,7 @@ export class AiInvestigationService {
         status: AiInvestigationStatus.FAILED,
         completedAt: new Date(),
         error,
+        failureCode: failureCode ?? null,
       },
     });
   }
@@ -948,6 +1037,7 @@ export class AiInvestigationService {
   private async failWithoutInvestigationRow(
     input: InvestigateInput,
     error: string,
+    failure?: RuntimeFailure,
   ): Promise<InvestigateResult> {
     const investigation = await this.prisma.aiInvestigation.create({
       data: {
@@ -958,6 +1048,7 @@ export class AiInvestigationService {
         status: "FAILED",
         completedAt: new Date(),
         error,
+        failureCode: failure?.code ?? null,
       },
     });
 
@@ -968,13 +1059,190 @@ export class AiInvestigationService {
       actorType: AuditActorType.AI_AGENT,
       entityType: "OPERATIONAL_EXCEPTION",
       entityId: input.exceptionId,
-      metadata: { investigationId: investigation.id, error },
+      metadata: {
+        investigationId: investigation.id,
+        error,
+        failureCode: failure?.code ?? null,
+      },
     });
 
     return {
       investigationId: investigation.id,
       status: "FAILED",
       error,
+      failure,
     };
   }
+
+  /**
+   * Phase 2C: every model invocation is budget-governed and accounted.
+   *
+   * Order of operations: per-investigation limits (model calls, tokens)
+   * and an ATOMIC token reservation are enforced BEFORE the provider call,
+   * so an exhausted budget stops further calls outright (BudgetExceededError
+   * -> persisted BUDGET_EXCEEDED outcome, never retried). After the call —
+   * success or failure — one AiModelCall row records the usage (or its
+   * absence) and the reservation is settled idempotently. Unknown usage
+   * keeps the conservative reservation and is marked uncertain; a request
+   * that provably never dispatched releases it entirely. Retries each make
+   * their own reservation against the same counters, so they can never
+   * bypass an exhausted budget.
+   */
+  private async callModelAccounted(
+    input: InvestigateInput,
+    investigationId: string,
+    request: LlmChatCompletionInput,
+  ): Promise<LlmChatCompletionResult> {
+    const provider = this.llmClient.provider ?? "unknown";
+    const model = this.config.get<string>("GROQ_MODEL") ?? "unknown";
+
+    const reservationTokens =
+      this.config.get<number>("AI_BUDGET_RESERVATION_TOKENS") ?? 4000;
+    const maxModelCalls =
+      this.config.get<number>("AI_INVESTIGATION_MAX_MODEL_CALLS") ?? 24;
+    const investigationTokenLimit =
+      this.config.get<number>("AI_INVESTIGATION_TOKEN_LIMIT") ?? 100000;
+
+    // Per-investigation governance is cross-attempt: the ledger remembers
+    // reservations from previous attempts of the same investigation, so a
+    // queue retry cannot restart its budgets from zero.
+    const summary = await this.budgetService.usageSummary(investigationId);
+
+    if (summary.entries >= maxModelCalls) {
+      throw new BudgetExceededError({
+        limitKind: "investigation_model_calls",
+        limit: maxModelCalls,
+        requested: 1,
+        reserved: summary.entries,
+      });
+    }
+
+    if (summary.reservedTokens + reservationTokens > investigationTokenLimit) {
+      throw new BudgetExceededError({
+        limitKind: "investigation_tokens",
+        limit: investigationTokenLimit,
+        requested: reservationTokens,
+        reserved: summary.reservedTokens,
+      });
+    }
+
+    const limits = await this.budgetService.limitsFor(input.tenantId, {
+      dailyTokenLimit:
+        this.config.get<number>("AI_TENANT_DAILY_TOKEN_LIMIT") ?? 2_000_000,
+      monthlyTokenLimit:
+        this.config.get<number>("AI_TENANT_MONTHLY_TOKEN_LIMIT") ?? 40_000_000,
+    });
+
+    const entry = await this.budgetService.reserve(
+      {
+        tenantId: input.tenantId,
+        storeId: input.storeId,
+        investigationId,
+        tokens: reservationTokens,
+      },
+      limits,
+    );
+
+    const startedAt = Date.now();
+
+    try {
+      const result = await this.llmClient.createChatCompletion(request);
+      const latencyMs = Date.now() - startedAt;
+
+      const usage = result.usage ?? {
+        inputTokens: null,
+        outputTokens: null,
+        totalTokens: result.tokensUsed ?? null,
+        source: "UNKNOWN" as const,
+      };
+
+      await this.usageService.recordModelCall({
+        tenantId: input.tenantId,
+        storeId: input.storeId,
+        investigationId,
+        provider,
+        model,
+        usage,
+        outcome: "SUCCESS",
+        latencyMs,
+      });
+
+      await this.budgetService.settle({
+        entryId: entry.id,
+        actualTokens: usage.totalTokens ?? null,
+        usageSource: usage.source,
+      });
+
+      return result;
+    } catch (error) {
+      const latencyMs = Date.now() - startedAt;
+      const failure = classifyThrownError(error, {
+        cancelled: Boolean(request.signal?.aborted),
+      });
+
+      // Failed attempts are accounted too: the provider may have consumed
+      // tokens even though no completion came back.
+      await this.usageService.recordModelCall({
+        tenantId: input.tenantId,
+        storeId: input.storeId,
+        investigationId,
+        provider,
+        model,
+        usage: {
+          inputTokens: null,
+          outputTokens: null,
+          totalTokens: null,
+          source: "UNKNOWN",
+        },
+        outcome: outcomeCodeForModelCall(failure),
+        failureCode: failure.code,
+        latencyMs,
+      });
+
+      const disposition = failure.providerDetail?.usageDisposition ?? "unknown";
+
+      if (disposition === "none") {
+        // The request provably never reached the provider — the
+        // reservation is released in full.
+        await this.budgetService.release(entry.id, failure.code);
+      } else {
+        // Consumption possible but unknown: keep the conservative
+        // reservation, mark the settlement uncertain. Never invent usage.
+        await this.budgetService.settle({
+          entryId: entry.id,
+          actualTokens: null,
+          usageSource: "UNKNOWN",
+          usageDisposition: "unknown",
+        });
+      }
+
+      throw error;
+    }
+  }
+}
+
+/**
+ * Stable classification for run-level failures. The run's own timeout is
+ * TIMEOUT (not CANCELLED, not a provider failure); an external abort is
+ * CANCELLED — never reported as a provider failure; budget exhaustion is
+ * BUDGET_EXCEEDED — never retried; everything else follows the provider
+ * taxonomy via LlmClientError.
+ */
+function classifyRunFailure(
+  error: unknown,
+  message: string,
+  flags: { timedOut: boolean; cancelled: boolean },
+): RuntimeFailure {
+  if (error instanceof BudgetExceededError) {
+    return runtimeFailure("BUDGET_EXCEEDED", message, {
+      retryable: false,
+      providerDetail: { kind: error.limitKind },
+    });
+  }
+
+  if (flags.timedOut) {
+    return runtimeFailure("TIMEOUT", message, { retryable: true });
+  }
+
+  return classifyThrownError(error, { cancelled: flags.cancelled });
 }
