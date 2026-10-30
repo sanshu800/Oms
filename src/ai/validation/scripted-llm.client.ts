@@ -3,6 +3,7 @@ import {
   LlmChatCompletionResult,
   LlmClient,
 } from "../llm/llm-client.interface";
+import { LlmClientError } from "../llm/llm-error";
 
 export type ScriptedTurn = {
   content?: string;
@@ -37,8 +38,15 @@ export class ScriptedLlmClient implements LlmClient {
   }
 
   async createChatCompletion(
-    _input: LlmChatCompletionInput,
+    input: LlmChatCompletionInput,
   ): Promise<LlmChatCompletionResult> {
+    if (input.signal?.aborted) {
+      throw new LlmClientError(
+        "cancelled",
+        "Provider call cancelled before dispatch (investigation run aborted)",
+      );
+    }
+
     if (this.throwMessage) {
       const message = this.throwMessage;
       this.throwMessage = null;

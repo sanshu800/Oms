@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { Prisma } from "@prisma/client";
 
 import { AiInvestigationService } from "./ai-investigation.service";
 import { SUBMIT_DECISION_PROPOSAL_TOOL } from "./ai-decision-proposal.schema";
@@ -38,12 +39,16 @@ function buildDeps(overrides: {
       create: vi.fn().mockResolvedValue({ id: "investigation-1" }),
       update: vi.fn().mockResolvedValue({}),
       updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+      findFirst: vi.fn().mockResolvedValue(null),
+      findUnique: vi.fn().mockResolvedValue(null),
     },
     aiToolCall: {
       create: vi.fn().mockResolvedValue({}),
+      findFirst: vi.fn().mockResolvedValue(null),
     },
     aiDecisionProposal: {
       create: vi.fn().mockResolvedValue({ id: "proposal-1" }),
+      findFirst: vi.fn().mockResolvedValue(null),
     },
     $transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) =>
       fn(prisma),
@@ -811,5 +816,175 @@ describe("AiInvestigationService", () => {
     expect(result.error).toMatch(/timed out before the proposal/i);
     expect(prisma.aiDecisionProposal.create).not.toHaveBeenCalled();
     expect(aiAutonomyService.maybeAutoExecute).not.toHaveBeenCalled();
+  });
+
+  // ---- Phase 2B: idempotency, concurrency, cancellation ----
+
+  function uniqueViolation(): Error {
+    return new Prisma.PrismaClientKnownRequestError(
+      "Unique constraint failed on the fields: (`tenantId`,`storeId`,`exceptionId`)",
+      { code: "P2002", clientVersion: "6.19.3" },
+    );
+  }
+
+  it("resumes the existing RUNNING row on a duplicate dispatch (no duplicate record)", async () => {
+    const createChatCompletion = vi
+      .fn()
+      .mockResolvedValueOnce({
+        message: {
+          role: "assistant",
+          content: null,
+          toolCalls: [
+            {
+              id: "call-1",
+              name: "get_order_detail",
+              arguments: { orderId: "order-1" },
+            },
+          ],
+        },
+        tokensUsed: 10,
+      })
+      .mockResolvedValueOnce({
+        message: {
+          role: "assistant",
+          content: null,
+          toolCalls: [
+            {
+              id: "call-2",
+              name: SUBMIT_DECISION_PROPOSAL_TOOL,
+              arguments: validProposalArgs,
+            },
+          ],
+        },
+        tokensUsed: 10,
+      });
+
+    const { service, prisma } = buildDeps({ createChatCompletion });
+
+    // The partial unique index rejects the second RUNNING row …
+    (prisma.aiInvestigation.create as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(uniqueViolation());
+    // … and the existing row's lease is free (expired): the run resumes it.
+    (prisma.aiInvestigation.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(
+      { id: "investigation-9" },
+    );
+    (prisma.aiToolCall.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(
+      { sequence: 7 },
+    );
+
+    const result = await service.investigate(baseInput);
+
+    expect(result.status).toBe("COMPLETED");
+    expect(result.investigationId).toBe("investigation-9");
+    // Exactly one authoritative record: the insert failed once and was NOT
+    // retried into a second row.
+    expect(prisma.aiInvestigation.create).toHaveBeenCalledTimes(1);
+    // Tool-call sequence continues past the resumed run's persisted rows.
+    expect(prisma.aiToolCall.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ sequence: 8 }),
+      }),
+    );
+  });
+
+  it("attaches to a live run without touching its row or publishing anything", async () => {
+    const { service, prisma, aiAutonomyService } = buildDeps({});
+
+    (prisma.aiInvestigation.create as ReturnType<typeof vi.fn>).mockRejectedValue(
+      uniqueViolation(),
+    );
+    (prisma.aiInvestigation.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(
+      { id: "investigation-9" },
+    );
+    // Lease held by a live executor …
+    (prisma.aiInvestigation.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue(
+      { count: 0 },
+    );
+    // … whose outcome the attached dispatch reports read-only.
+    (prisma.aiInvestigation.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+      { id: "investigation-9", status: "COMPLETED", error: null },
+    );
+    (prisma.aiDecisionProposal.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(
+      { id: "proposal-77" },
+    );
+
+    const result = await service.investigate(baseInput);
+
+    expect(result).toMatchObject({
+      investigationId: "investigation-9",
+      status: "COMPLETED",
+      proposalId: "proposal-77",
+      attachedToActiveRun: true,
+    });
+    expect(prisma.aiDecisionProposal.create).not.toHaveBeenCalled();
+    expect(aiAutonomyService.maybeAutoExecute).not.toHaveBeenCalled();
+    // The attached dispatch never finalizes anything: the only write it
+    // attempted was the (rejected) lease claim.
+    const writes = (prisma.aiInvestigation.updateMany as ReturnType<typeof vi.fn>)
+      .mock.calls;
+    expect(writes).toHaveLength(1);
+  });
+
+  it("propagates the abort signal to the provider and fires it on timeout", async () => {
+    let capturedSignal: AbortSignal | null = null;
+
+    const createChatCompletion = vi.fn().mockImplementation(
+      (input: { signal?: AbortSignal }) =>
+        new Promise(() => {
+          capturedSignal = input.signal ?? null;
+        }),
+    );
+
+    const { service } = buildDeps({
+      createChatCompletion,
+      configValues: { AI_INVESTIGATION_TIMEOUT_MS: 25 },
+    });
+
+    const result = await service.investigate(baseInput);
+
+    expect(result.status).toBe("FAILED");
+    expect(result.error).toMatch(/timed out/i);
+    // The provider request was PHYSICALLY cancelled (fetch-abort signal).
+    expect(capturedSignal).not.toBeNull();
+    expect((capturedSignal as unknown as AbortSignal).aborted).toBe(true);
+  });
+
+  it("guards the completion claim with the run's execution lease", async () => {
+    const createChatCompletion = vi.fn().mockResolvedValue({
+      message: {
+        role: "assistant",
+        content: null,
+        toolCalls: [
+          {
+            id: "call-1",
+            name: SUBMIT_DECISION_PROPOSAL_TOOL,
+            arguments: validProposalArgs,
+          },
+        ],
+      },
+      tokensUsed: 10,
+    });
+
+    const { service, prisma } = buildDeps({ createChatCompletion });
+
+    const result = await service.investigate(baseInput);
+
+    expect(result.status).toBe("COMPLETED");
+
+    const completionClaim = (
+      prisma.aiInvestigation.updateMany as ReturnType<typeof vi.fn>
+    ).mock.calls.find((call: unknown[]) => {
+      const args = call[0] as { data?: { status?: string } };
+      return args.data?.status === "COMPLETED";
+    });
+
+    expect(completionClaim).toBeDefined();
+    const where = (completionClaim as unknown as [{ where: Record<string, unknown> }])[0]
+      .where;
+    // A run whose lease was taken over cannot finalize or publish.
+    expect(where.executionClaimId).toEqual(expect.any(String));
+    expect(where.tenantId).toBe("tenant-1");
+    expect(where.exceptionId).toBe("exception-1");
+    expect(where.status).toBe("RUNNING");
   });
 });

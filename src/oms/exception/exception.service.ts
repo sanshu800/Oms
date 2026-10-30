@@ -1,4 +1,4 @@
-﻿import { Injectable } from "@nestjs/common";
+import { Injectable } from "@nestjs/common";
 import { ExceptionSeverity, ExceptionStatus, Prisma } from "@prisma/client";
 import { PrismaService } from "../../prisma/prisma.service";
 import { AiInvestigationQueueService } from "../../ai/queue/ai-investigation.queue";
@@ -94,6 +94,11 @@ export class ExceptionService {
         tenantId: input.tenantId,
         storeId: input.storeId,
         exceptionId: exception.id,
+        // Stable per-dispatch identity (the raise/re-open event's row
+        // state): a double-enqueue of the SAME dispatch collapses to one
+        // BullMQ job. Later re-opens update the row and therefore get a
+        // fresh dispatch key.
+        dispatchKey: `${exception.id}:${exception.updatedAt.getTime()}`,
       });
     }
 

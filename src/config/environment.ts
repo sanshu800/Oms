@@ -117,6 +117,16 @@ const schema = z
       .min(1)
       .default("openai/gpt-oss-120b"),
 
+    // Phase 2B: bounded provider request timeout (ms), clamped again in
+    // GroqLlmClient. The HTTP client never retries on its own.
+    GROQ_TIMEOUT_MS: z
+      .coerce
+      .number()
+      .int()
+      .min(100)
+      .max(120000)
+      .default(30000),
+
     // Optional Jev (TypeSafe AI) DecisionModel settings. Advisory-only
     // capability: no key is required for local development or tests, and
     // nothing calls the provider unless DECISION_MODEL_ENGINE=jev is set
@@ -160,6 +170,65 @@ const schema = z
       .int()
       .min(1000)
       .default(20000),
+
+    // Phase 2B queue reliability: bounded job retries with exponential
+    // backoff; failed jobs are RETAINED (never silently discarded) so an
+    // operator can inspect exhausted dispatches.
+    AI_INVESTIGATION_JOB_ATTEMPTS: z
+      .coerce
+      .number()
+      .int()
+      .min(1)
+      .max(10)
+      .default(5),
+
+    AI_INVESTIGATION_JOB_BACKOFF_MS: z
+      .coerce
+      .number()
+      .int()
+      .min(100)
+      .default(5000),
+
+    AI_INVESTIGATION_JOB_REMOVE_ON_FAIL: z
+      .coerce
+      .number()
+      .int()
+      .min(0)
+      .default(500),
+
+    // Phase 2B bounded recovery of abandoned RUNNING investigations
+    // (expired execution leases). Sweep interval 0 disables the periodic
+    // sweep. Recovered runs are capped per investigation (MAX_RECOVERIES)
+    // and abandoned outright beyond MAX_AGE_MS.
+    AI_RECOVERY_SWEEP_INTERVAL_MS: z
+      .coerce
+      .number()
+      .int()
+      .min(0)
+      .default(60000),
+
+    AI_INVESTIGATION_MAX_RECOVERIES: z
+      .coerce
+      .number()
+      .int()
+      .min(0)
+      .max(10)
+      .default(2),
+
+    AI_INVESTIGATION_MAX_AGE_MS: z
+      .coerce
+      .number()
+      .int()
+      .min(60000)
+      .default(3600000),
+
+    AI_INVESTIGATION_RECOVERY_LIMIT: z
+      .coerce
+      .number()
+      .int()
+      .min(1)
+      .max(100)
+      .default(10),
   })
   .superRefine((values, context) => {
     const appDomain = values.APP_DOMAIN;

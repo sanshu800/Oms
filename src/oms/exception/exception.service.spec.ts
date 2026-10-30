@@ -1,4 +1,4 @@
-﻿import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ExceptionService } from "./exception.service";
 import { ExceptionSeverity, ExceptionStatus } from "@prisma/client";
 
@@ -139,6 +139,7 @@ describe("ExceptionService", () => {
     prisma.operationalException.upsert.mockResolvedValue({
       id: "exception-new",
       status: ExceptionStatus.OPEN,
+      updatedAt: new Date("2026-01-01T00:00:00Z"),
     });
 
     await service.raise({
@@ -152,11 +153,15 @@ describe("ExceptionService", () => {
       recommendedNextStep: "Reconcile.",
     });
 
-    expect(aiInvestigationQueue.enqueue).toHaveBeenCalledWith({
-      tenantId: "tenant-1",
-      storeId: "store-1",
-      exceptionId: "exception-new",
-    });
+    expect(aiInvestigationQueue.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tenantId: "tenant-1",
+        storeId: "store-1",
+        exceptionId: "exception-new",
+        // Stable per-dispatch identity for queue-level dedupe.
+        dispatchKey: expect.stringContaining("exception-new:"),
+      }),
+    );
   });
 
   it("should enqueue an AI investigation when a resolved exception reopens", async () => {
@@ -170,6 +175,7 @@ describe("ExceptionService", () => {
     prisma.operationalException.upsert.mockResolvedValue({
       id: "exception-1",
       status: ExceptionStatus.OPEN,
+      updatedAt: new Date("2026-01-01T00:00:00Z"),
     });
 
     await service.raise({

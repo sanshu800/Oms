@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { PrismaClient } from "@prisma/client";
+
 import { ConfigService } from "@nestjs/config";
 import { Queue } from "bullmq";
 
@@ -23,7 +23,9 @@ async function main() {
   const install = await shopifyAuth.activateStore(shopDomain, "fake-token", ["read_orders"]);
 
   const queue = new Queue("ai-investigation", { connection: { host: "localhost", port: 6379 } });
-  const aiQueue = new AiInvestigationQueueService(queue as any);
+  const aiQueue = new AiInvestigationQueueService(queue as any, {
+    get: () => undefined,
+  } as any);
   const exceptionService = new ExceptionService(prisma, aiQueue);
   const riskDetector = new RiskDetectorService(prisma, exceptionService);
 

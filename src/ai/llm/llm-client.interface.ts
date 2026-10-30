@@ -44,6 +44,12 @@ export type LlmToolDefinition = {
 export type LlmChatCompletionInput = {
   messages: LlmMessage[];
   tools: LlmToolDefinition[];
+  /**
+   * Cancellation signal owned by the investigation run. Providers MUST
+   * forward it to the underlying HTTP request (physically aborting it when
+   * the transport supports abort) and MUST NOT retry after abort.
+   */
+  signal?: AbortSignal;
 };
 
 export type LlmChatCompletionResult = {

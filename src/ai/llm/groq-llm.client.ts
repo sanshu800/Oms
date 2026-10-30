@@ -1,4 +1,4 @@
-import { Inject, Injectable, InternalServerErrorException } from "@nestjs/common";
+import { Injectable } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import Groq from "groq-sdk";
 
@@ -7,14 +7,47 @@ import {
   LlmChatCompletionResult,
   LlmClient,
   LlmMessage,
-  LlmToolCallRequest,
 } from "./llm-client.interface";
+import { LlmClientError } from "./llm-error";
 
+/** Provider timeout bounds (ms), clamped like the Jev client's convention. */
+const MIN_PROVIDER_TIMEOUT_MS = 1_000;
+const MAX_PROVIDER_TIMEOUT_MS = 120_000;
+const DEFAULT_PROVIDER_TIMEOUT_MS = 30_000;
+
+/**
+ * Live LLM provider client (Groq).
+ *
+ * Lifecycle contract (Phase 2B):
+ * - Every request is bounded by a configurable timeout
+ *   (`GROQ_TIMEOUT_MS`, clamped 1s–120s) AND by the caller's AbortSignal.
+ * - The AbortSignal is forwarded to the HTTP request — aborting PHYSICALLY
+ *   cancels the fetch (groq-sdk supports request abort); it does not merely
+ *   discard the response.
+ * - No uncontrolled automatic retry: the SDK client is constructed with
+ *   maxRetries: 0 (its default is 2) and every request repeats that.
+ *   Retry policy belongs to the job layer (BullMQ), not the HTTP client.
+ * - Failures are classified into the shared LlmClientError vocabulary
+ *   (timeout | cancelled | transport | http | malformed_response).
+ */
 @Injectable()
 export class GroqLlmClient implements LlmClient {
   private client: Groq | null = null;
 
   constructor(private readonly config: ConfigService) {}
+
+  private get timeoutMs(): number {
+    const configured = this.config.get<number>("GROQ_TIMEOUT_MS");
+
+    if (typeof configured !== "number" || !Number.isFinite(configured)) {
+      return DEFAULT_PROVIDER_TIMEOUT_MS;
+    }
+
+    return Math.min(
+      Math.max(Math.floor(configured), MIN_PROVIDER_TIMEOUT_MS),
+      MAX_PROVIDER_TIMEOUT_MS,
+    );
+  }
 
   private getClient(): Groq {
     if (this.client) {
@@ -24,12 +57,19 @@ export class GroqLlmClient implements LlmClient {
     const apiKey = this.config.get<string>("GROQ_API_KEY");
 
     if (!apiKey) {
-      throw new InternalServerErrorException(
+      throw new LlmClientError(
+        "transport",
         "GROQ_API_KEY is not configured",
+        { retryable: false },
       );
     }
 
-    this.client = new Groq({ apiKey });
+    // maxRetries: 0 — the HTTP client must never retry on its own.
+    this.client = new Groq({
+      apiKey,
+      timeout: this.timeoutMs,
+      maxRetries: 0,
+    });
 
     return this.client;
   }
@@ -40,28 +80,52 @@ export class GroqLlmClient implements LlmClient {
     const model =
       this.config.get<string>("GROQ_MODEL") ?? "openai/gpt-oss-120b";
 
-    const completion = await this.getClient().chat.completions.create({
-      model,
-      messages: input.messages.map(toGroqMessage),
-      tools:
-        input.tools.length > 0
-          ? input.tools.map((tool) => ({
-              type: "function" as const,
-              function: {
-                name: tool.name,
-                description: tool.description,
-                parameters: tool.parameters,
-              },
-            }))
-          : undefined,
-      tool_choice: input.tools.length > 0 ? "auto" : undefined,
-    });
+    if (input.signal?.aborted) {
+      throw new LlmClientError(
+        "cancelled",
+        "Provider call cancelled before dispatch (investigation run aborted)",
+      );
+    }
+
+    let completion: Groq.Chat.ChatCompletion;
+
+    try {
+      completion = await this.getClient().chat.completions.create(
+        {
+          model,
+          messages: input.messages.map(toGroqMessage),
+          tools:
+            input.tools.length > 0
+              ? input.tools.map((tool) => ({
+                  type: "function" as const,
+                  function: {
+                    name: tool.name,
+                    description: tool.description,
+                    parameters: tool.parameters,
+                  },
+                }))
+              : undefined,
+          tool_choice: input.tools.length > 0 ? "auto" : undefined,
+        },
+        {
+          // Per-request lifecycle: bounded timeout, caller-owned abort,
+          // and no client-side retries.
+          signal: input.signal ?? undefined,
+          timeout: this.timeoutMs,
+          maxRetries: 0,
+        },
+      );
+    } catch (error) {
+      throw classifyProviderError(error, input.signal);
+    }
 
     const choice = completion.choices[0];
 
     if (!choice) {
-      throw new InternalServerErrorException(
+      throw new LlmClientError(
+        "malformed_response",
         "Groq returned no completion choices",
+        { retryable: false },
       );
     }
 
@@ -70,6 +134,61 @@ export class GroqLlmClient implements LlmClient {
       tokensUsed: completion.usage?.total_tokens ?? null,
     };
   }
+}
+
+/**
+ * Map groq-sdk (fetch) failures onto the shared failure vocabulary. The
+ * caller's AbortSignal distinguishes "cancelled by the owning run" from the
+ * provider's own timeout, even though both surface as aborts deep in fetch.
+ */
+export function classifyProviderError(
+  error: unknown,
+  signal?: AbortSignal,
+): LlmClientError {
+  if (error instanceof LlmClientError) {
+    return error;
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+
+  if (signal?.aborted) {
+    return new LlmClientError(
+      "cancelled",
+      `Provider call cancelled by the owning investigation run: ${message}`,
+      { cause: error, retryable: false },
+    );
+  }
+
+  if (error instanceof Groq.APIUserAbortError) {
+    return new LlmClientError("cancelled", message, {
+      cause: error,
+      retryable: false,
+    });
+  }
+
+  if (error instanceof Groq.APIConnectionTimeoutError) {
+    return new LlmClientError("timeout", message, { cause: error });
+  }
+
+  if (error instanceof Groq.APIConnectionError) {
+    return new LlmClientError("transport", message, { cause: error });
+  }
+
+  if (error instanceof Groq.APIError) {
+    const status =
+      typeof error.status === "number" ? error.status : undefined;
+
+    return new LlmClientError("http", message, {
+      cause: error,
+      status,
+      retryable: status === 429 || (status !== undefined && status >= 500),
+    });
+  }
+
+  return new LlmClientError("transport", message, {
+    cause: error,
+    retryable: false,
+  });
 }
 
 function toGroqMessage(message: LlmMessage): Groq.Chat.ChatCompletionMessageParam {
@@ -81,13 +200,13 @@ function toGroqMessage(message: LlmMessage): Groq.Chat.ChatCompletionMessagePara
     };
   }
 
-  if (message.role === "assistant") {
+  if (message.role === "assistant" && message.toolCalls?.length) {
     return {
       role: "assistant",
       content: message.content,
-      tool_calls: message.toolCalls?.map((call) => ({
+      tool_calls: message.toolCalls.map((call) => ({
         id: call.id,
-        type: "function" as const,
+        type: "function",
         function: {
           name: call.name,
           arguments: JSON.stringify(call.arguments),
@@ -99,37 +218,35 @@ function toGroqMessage(message: LlmMessage): Groq.Chat.ChatCompletionMessagePara
   return {
     role: message.role,
     content: message.content ?? "",
-  };
+  } as Groq.Chat.ChatCompletionMessageParam;
 }
 
 function fromGroqMessage(
-  message: Groq.Chat.Completions.ChatCompletionMessage,
+  message: Groq.Chat.ChatCompletionMessage,
 ): LlmMessage {
-  const toolCalls: LlmToolCallRequest[] | undefined = message.tool_calls
-    ?.filter((call) => call.type === "function")
-    .map((call) => ({
-      id: call.id,
-      name: call.function.name,
-      arguments: safeParseJsonObject(call.function.arguments),
-    }));
+  const toolCalls = message.tool_calls?.map((call) => ({
+    id: call.id,
+    name: call.function.name,
+    arguments: safeParseObject(call.function.arguments),
+  }));
 
   return {
     role: "assistant",
-    content: message.content ?? null,
-    toolCalls: toolCalls && toolCalls.length > 0 ? toolCalls : undefined,
+    content: message.content,
+    toolCalls,
   };
 }
 
-function safeParseJsonObject(raw: string): Record<string, unknown> {
+function safeParseObject(raw: string): Record<string, unknown> {
   try {
-    const parsed = JSON.parse(raw);
+    const parsed: unknown = JSON.parse(raw);
 
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
       return parsed as Record<string, unknown>;
     }
-
-    return {};
   } catch {
-    return {};
+    // fall through
   }
+
+  return {};
 }

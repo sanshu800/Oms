@@ -1144,6 +1144,16 @@ model AiInvestigation {
 
   error String?
 
+  // Phase 2B execution lease: claimed by the worker executing this run's
+  // tool loop. A claim is valid while the row is RUNNING and the claim is
+  // newer than the configured lease; expired claims mark abandoned runs.
+  // NOTE: the one-active-investigation guarantee is enforced by a partial
+  // unique index over RUNNING (tenantId, storeId, exceptionId) rows created
+  // in migration 20261030120000_ai_investigation_concurrency (partial
+  // indexes cannot be expressed in the Prisma schema).
+  executionClaimId    String?
+  executionClaimedAt  DateTime?
+
   toolCalls AiToolCall[]
   proposals AiDecisionProposal[]
 
