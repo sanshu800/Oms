@@ -26,6 +26,15 @@ export type InvestigateInput = {
   tenantId: string;
   storeId: string;
   exceptionId: string;
+  /**
+   * Set by the queue worker when BullMQ REDelivered the job (attemptsMade
+   * > 0): the broker has declared the previous consumer's lock expired, so
+   * the run may take over an existing execution lease without waiting for
+   * lease expiry. This is safe — the lease-guarded completion/failure
+   * claims still guarantee at-most-once publication, so a late zombie
+   * executor cannot finalize anything after takeover.
+   */
+  takeoverClaim?: boolean;
 };
 
 export type InvestigateResult = {
@@ -739,15 +748,24 @@ export class AiInvestigationService {
 
       const leaseCutoff = new Date(Date.now() - this.leaseMs());
 
+      // Lease claim: atomic single-winner update. Without takeover only a
+      // free or EXPIRED lease may be claimed; with takeover (BullMQ
+      // redelivery) any lease may be claimed — the previous consumer is
+      // broker-declared dead, and lease-guarded claims keep publication
+      // at-most-once even if it is actually a zombie.
       const taken = await this.prisma.aiInvestigation.updateMany({
         where: {
           id: existing.id,
           status: AiInvestigationStatus.RUNNING,
-          OR: [
-            { executionClaimId: null },
-            { executionClaimedAt: null },
-            { executionClaimedAt: { lt: leaseCutoff } },
-          ],
+          ...(input.takeoverClaim
+            ? {}
+            : {
+                OR: [
+                  { executionClaimId: null },
+                  { executionClaimedAt: null },
+                  { executionClaimedAt: { lt: leaseCutoff } },
+                ],
+              }),
         },
         data: {
           executionClaimId: claimId,

@@ -73,6 +73,41 @@ function job(overrides: Partial<Job> = {}): Job {
 }
 
 describe("AiInvestigationWorker reliability contract", () => {
+  it("passes takeoverClaim on redelivery and not on first delivery", async () => {
+    const investigate = vi.fn().mockResolvedValue({
+      investigationId: "inv-1",
+      status: "COMPLETED",
+      proposalId: "proposal-1",
+    });
+
+    const { worker } = buildWorker({ investigate });
+
+    await worker.process(job({ attemptsMade: 0 }) as never);
+    expect(investigate).toHaveBeenLastCalledWith(
+      expect.objectContaining({ takeoverClaim: false }),
+    );
+
+    await worker.process(job({ attemptsMade: 2 }) as never);
+    expect(investigate).toHaveBeenLastCalledWith(
+      expect.objectContaining({ takeoverClaim: true }),
+    );
+
+    // Stall redelivery: attemptsMade stays 0 but attemptsStarted > 1.
+    await worker.process(
+      job({ attemptsMade: 0, attemptsStarted: 2 } as never) as never,
+    );
+    expect(investigate).toHaveBeenLastCalledWith(
+      expect.objectContaining({ takeoverClaim: true }),
+    );
+
+    await worker.process(
+      job({ attemptsMade: 0, attemptsStarted: 1 } as never) as never,
+    );
+    expect(investigate).toHaveBeenLastCalledWith(
+      expect.objectContaining({ takeoverClaim: false }),
+    );
+  });
+
   it("treats a persisted FAILED investigation as a permanent job outcome", async () => {
     const investigate = vi.fn().mockResolvedValue({
       investigationId: "inv-1",
@@ -174,9 +209,12 @@ describe("AiInvestigationWorker reliability contract", () => {
       expect.objectContaining({
         tenantId: "tenant-1",
         exceptionId: "exception-1",
-        dispatchKey: "recovery:inv-1:1",
+        dispatchKey: expect.stringMatching(/^recovery:inv-1-\d+$/),
       }),
-      expect.objectContaining({ attempts: 1 }),
+      expect.objectContaining({
+        attempts: 1,
+        jobId: expect.stringMatching(/^investigate:recovery:inv-1-\d+$/),
+      }),
     );
   });
 });

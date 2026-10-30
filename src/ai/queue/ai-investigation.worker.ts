@@ -76,6 +76,15 @@ export class AiInvestigationWorker extends WorkerHost {
           tenantId,
           storeId,
           exceptionId,
+          // Redelivery (retry after failure, or stall recovery after a
+          // terminated consumer): BullMQ proved the previous owner is gone,
+          // so allow lease takeover instead of waiting for lease expiry.
+          // attemptsStarted > 1 covers stall redelivery (attemptsMade is
+          // only incremented on explicit failures).
+          takeoverClaim:
+            job.attemptsMade > 0 ||
+            (typeof job.attemptsStarted === "number" &&
+              job.attemptsStarted > 1),
         }),
       );
 
@@ -151,22 +160,39 @@ export class AiInvestigationWorker extends WorkerHost {
       // Controlled recovery: re-enqueue a normal investigation job for the
       // abandoned run. Its scope re-attaches to the SAME authoritative row
       // (resume semantics) — no duplicate records, no duplicate proposals.
-      await this.queue.add(
-        AI_INVESTIGATION_JOB,
-        {
-          tenantId: action.tenantId,
-          storeId: action.storeId,
-          exceptionId: action.exceptionId,
-          dispatchKey: `recovery:${action.investigationId}:${
-            (job.attemptsMade ?? 0) + 1
+      //
+      // Job-id shape must be exactly 3 colon-separated parts (BullMQ
+      // rejects custom ids containing ':' unless split(':').length === 3),
+      // and unique per redispatch so a later sweep can recover again.
+      const dispatchKey = `recovery:${action.investigationId}-${Date.now()}`;
+
+      try {
+        await this.queue.add(
+          AI_INVESTIGATION_JOB,
+          {
+            tenantId: action.tenantId,
+            storeId: action.storeId,
+            exceptionId: action.exceptionId,
+            dispatchKey,
+          },
+          {
+            // Deterministic job id — the SAME dedupe contract as regular
+            // dispatches (a repeated sweep cannot double-enqueue a recovery).
+            jobId: `investigate:${dispatchKey}`,
+            attempts: 1,
+            removeOnComplete: 1000,
+            removeOnFail: 100,
+          },
+        );
+      } catch (addError) {
+        // One failed redispatch must not fail the whole sweep (a failing
+        // sweep job would retry and re-run every recovery side effect).
+        this.logger.error(
+          `Recovery redispatch for investigation ${action.investigationId} failed: ${
+            addError instanceof Error ? addError.message : String(addError)
           }`,
-        },
-        {
-          attempts: 1,
-          removeOnComplete: 1000,
-          removeOnFail: 100,
-        },
-      );
+        );
+      }
     }
 
     this.logger.log(

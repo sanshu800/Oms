@@ -949,6 +949,53 @@ describe("AiInvestigationService", () => {
     expect((capturedSignal as unknown as AbortSignal).aborted).toBe(true);
   });
 
+  it("takes over a live lease on redelivery (BullMQ stall recovery) but never otherwise", async () => {
+    const createChatCompletion = vi.fn().mockResolvedValue({
+      message: {
+        role: "assistant",
+        content: null,
+        toolCalls: [
+          {
+            id: "call-1",
+            name: SUBMIT_DECISION_PROPOSAL_TOOL,
+            arguments: validProposalArgs,
+          },
+        ],
+      },
+      tokensUsed: 10,
+    });
+
+    const { service, prisma } = buildDeps({ createChatCompletion });
+
+    (prisma.aiInvestigation.create as ReturnType<typeof vi.fn>).mockRejectedValue(
+      uniqueViolation(),
+    );
+    (prisma.aiInvestigation.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(
+      { id: "investigation-9" },
+    );
+    (prisma.aiInvestigation.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue(
+      { count: 1 },
+    );
+
+    const result = await service.investigate({
+      ...baseInput,
+      takeoverClaim: true,
+    });
+
+    expect(result.status).toBe("COMPLETED");
+    expect(result.investigationId).toBe("investigation-9");
+
+    // The lease-claim update must NOT contain the lease-expiry OR filter —
+    // takeover claims unconditionally (single-winner atomicity unchanged).
+    const leaseClaim = (
+      prisma.aiInvestigation.updateMany as ReturnType<typeof vi.fn>
+    ).mock.calls.find((call: unknown[]) => {
+      const args = call[0] as { where?: { OR?: unknown } };
+      return args.where && args.where.OR === undefined;
+    });
+    expect(leaseClaim).toBeDefined();
+  });
+
   it("guards the completion claim with the run's execution lease", async () => {
     const createChatCompletion = vi.fn().mockResolvedValue({
       message: {
